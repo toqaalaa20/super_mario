@@ -1,38 +1,30 @@
-import 'dotenv/config';
-import { DjsConnect } from "@unitn-asa/deliveroo-js-sdk";
+import { DjsConnect } from '@unitn-asa/deliveroo-js-sdk';
+import dotenv from 'dotenv';
+dotenv.config();
 
-async function run() {
-    const socket = await DjsConnect();
-    console.log("🚀 Socket created!");
+const socket = new DjsConnect(
+    process.env.DELIVEROO_HOST || 'http://localhost:8080',
+    process.env.DELIVEROO_TOKEN
+);
 
-    socket.on('connect', () => {
-        console.log("✅ Connected to server!");
-    });
+let myPosition = { x: 0, y: 0 };
 
-    socket.on('connect_error', (err) => {
-        console.error("❌ Connection error:", err.message);
-        // Don't exit — let it retry
-    });
+socket.on('you', (id, name, x, y) => {
+    myPosition = { x, y };
+});
 
-    socket.on('disconnect', (reason) => {
-        console.log("⚠️ Disconnected:", reason);
-    });
+socket.on('map', async (width, height, tiles) => {
+    // Move along predefined path
+    const path = ['right', 'right', 'down', 'down', 'left', 'left', 'up', 'up'];
 
-    socket.on('you', (me) => {
-        console.log("🧍 Position:", me.x, me.y, "| Score:", me.score);
-    });
+    for (const direction of path) {
+        const result = await socket.emitMove(direction);
+        if (!result) {
+            console.log(`Move ${direction} failed, retrying...`);
+            await new Promise(r => setTimeout(r, 100));
+        }
+    }
 
-    socket.on('map', (width, height, tiles) => {
-        console.log("🗺️ Map:", width, "x", height);
-    });
-
-    socket.on('parcels sensing', (parcels) => {
-        console.log("📦 Parcels nearby:", parcels.length);
-    });
-
-    socket.on('agents sensing', (agents) => {
-        console.log("🤖 Agents nearby:", agents.length);
-    });
-}
-
-run();
+    // Pickup parcels
+    await socket.emitPickup();
+});
