@@ -1,0 +1,63 @@
+import { beliefs, freeParcels, deliveryTiles } from './beliefs.js';
+import { manhattan } from './utils.js';
+
+export const INTENTION = {
+    PICKUP: 'pickup',
+    DELIVER: 'deliver',
+    EXPLORE: 'explore',
+};
+
+let current = null;
+
+export function getCurrentIntention() {
+    return current;
+}
+
+export function reviseIntention() {
+    const me = beliefs.me;
+    if (!me) return;
+
+    let nextIntention = null;
+
+    // 1. Carrying parcels -> find nearest delivery tile
+    if (beliefs.carrying.length > 0) {
+        const nearest = deliveryTiles()
+            .sort((a, b) => manhattan(me, a) - manhattan(me, b))[0];
+        if (nearest) {
+            nextIntention = { type: INTENTION.DELIVER, target: nearest };
+        }
+    }
+
+    // 2. No parcels carried? -> Free parcels visible -> pick best reward/distance ratio
+    if (!nextIntention) {
+        const candidates = freeParcels()
+            .filter(p => p.reward > 5)
+            .sort((a, b) => {
+                const sA = a.reward / (manhattan(me, a) + 1);
+                const sB = b.reward / (manhattan(me, b) + 1);
+                return sB - sA;
+            });
+
+        if (candidates.length > 0) {
+            const best = candidates[0];
+            nextIntention = { type: INTENTION.PICKUP, target: best };
+        }
+    }
+
+    // 3. Nothing visible or useful -> explore
+    if (!nextIntention) {
+        nextIntention = { type: INTENTION.EXPLORE, target: null };
+    }
+
+    // --- Logging Switch Logic ---
+    const changed = !current || 
+                    current.type !== nextIntention.type || 
+                    (current.target?.id !== nextIntention.target?.id) ||
+                    (current.target?.x !== nextIntention.target?.x || current.target?.y !== nextIntention.target?.y);
+
+    if (changed) {
+        console.log(`[INTENTION] Switch: ${current?.type || 'NONE'} -> ${nextIntention.type}`, 
+            nextIntention.target ? `(Target: ${nextIntention.target.x}, ${nextIntention.target.y})` : '');
+        current = nextIntention;
+    }
+}
