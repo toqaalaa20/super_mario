@@ -7,26 +7,30 @@ export const beliefs = {
 };
 
 export function updateFromSensing({ me, parcels, agents }) {
-    if (me) {
-        beliefs.me = {
-            ...me,
-            x: Math.round(me.x),
-            y: Math.round(me.y),
-        };
-        beliefs.carrying = me.carrying ?? [];
-    }
-
     for (const p of parcels ?? []) {
-        if (p.reward > 0) beliefs.parcels.set(p.id, p);
-        else beliefs.parcels.delete(p.id); // parcel expired
+        if (p.carriedBy === beliefs.me?.id){
+            if (!beliefs.carrying.includes(p.id)) {
+                beliefs.carrying.push(p.id);
+            }
+            beliefs.parcels.delete(p.id); // remove from visible parcels if now carrying
+        } else if (!p.carriedBy) {
+            if (p.reward > 0) {
+                beliefs.parcels.set(p.id, p);
+            } else {
+                beliefs.parcels.delete(p.id); // parcel expired
+            }
+        } else {
+            beliefs.parcels.delete(p.id); // carried by someone else, not visible
+        }
     }
 
     for (const a of agents ?? []) {
-        beliefs.agents.set(a.id, a);
+            beliefs.agents.set(a.id, a);
     }
 
     console.log('beliefs.me', beliefs.me);
     console.log('beliefs.parcels', [...beliefs.parcels.values()]);
+    console.log('beliefs.carrying', beliefs.carrying);
 }
 
 export function setMap(tiles) {
