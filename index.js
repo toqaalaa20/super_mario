@@ -11,6 +11,7 @@ const socket = new DjsConnect(
 const beliefset = new Map();
 const parcels = new Map();
 const deliveryTiles = [];
+const spawnerTiles = [];
 const start = Date.now();
 
 const me = { id: '', name: '', x: -1, y: -1, score: 0, carrying: [] };
@@ -20,38 +21,40 @@ socket.onConfig(config => OBSERVATION_DISTANCE = config.GAME.player.observation_
 
 // --- LISTENERS ---
 
-socket.onYou(({ id, name, x, y, score }) => {
+// Parse map: only store delivery tiles here, do NOT walk path here
+socket.on('map', (width, height, tiles) => {
+    for (const tile of tiles) {
+        if (tile.type === '1') spawnerTiles.push({ x: tile.x, y: tile.y });
+        if (tile.type === '2') {
+            deliveryTiles.push({ x: tile.x, y: tile.y });
+        }
+        
+    }
+    console.log(`Map loaded. Delivery points found: ${deliveryTiles.length}`);
+});
+
+let pathDone = false; // guard: only run predefined path once
+
+socket.onYou(async ({ id, name, x, y, score }) => {
+    // Update state
+    const firstAuth = !me.id;
     me.id = id;
     me.name = name;
     me.x = x !== undefined ? x : me.x;
     me.y = y !== undefined ? y : me.y;
     me.score = score;
-});
 
-// Parse map: store delivery tiles, then walk predefined path and pick up
-socket.on('map', async (width, height, tiles) => {
-    for (const tile of tiles) {
-        if (tile.type === 2) {
-            deliveryTiles.push({ x: tile.x, y: tile.y });
+    // On first authentication, walk the predefined path
+    if (firstAuth && !pathDone) {
+        pathDone = true;
+        console.log('Authenticated, walking predefined path...');
+        const path = ['right', 'right', 'down', 'down', 'left', 'left', 'up', 'up'];
+        for (const direction of path) {
+            await resilientMove(direction);
         }
+        await socket.emitPickup();
+        console.log('Predefined path complete. Switching to autonomous mode.');
     }
-    console.log(`Map loaded. Delivery points found: ${deliveryTiles.length}`);
-
-    // LAB REQUIREMENT: Walk a predefined path on startup
-    const path = ['right', 'right', 'down', 'down', 'left', 'left', 'up', 'up'];
-    console.log('Walking predefined path...');
-    for (const direction of path) {
-        const result = await socket.emitMove(direction);
-        if (!result) {
-            console.log(`Move ${direction} failed, retrying...`);
-            await new Promise(r => setTimeout(r, 100));
-            await socket.emitMove(direction); // one retry
-        }
-    }
-
-    // Pick up anything at current position after the path
-    await socket.emitPickup();
-    console.log('Predefined path complete. Switching to autonomous mode.');
 });
 
 socket.onSensing(({ parcels: sensedParcels, agents }) => {
@@ -103,7 +106,6 @@ function distance({ x: x1, y: y1 }, { x: x2, y: y2 }) {
 async function blindMove(target) {
     console.log(`${me.name} moving from (${me.x},${me.y}) towards (${target.x},${target.y})`);
 
-    // Promise that resolves once the agent is fully on a tile (not mid-animation)
     const moved = new Promise(res =>
         socket.onYou(({ x, y }) => (x % 1 !== 0 || y % 1 !== 0) ? null : res())
     );
@@ -130,10 +132,24 @@ async function resilientMove(direction, maxRetries = 3) {
 // --- MAIN LOOP ---
 
 async function main() {
+    // Wait until authenticated before starting the loop
+    await new Promise(res => {
+        const check = setInterval(() => {
+            if (me.id) { clearInterval(check); res(); }
+        }, 100);
+    });
+
+    // Also wait for predefined path to finish
+    await new Promise(res => {
+        const check = setInterval(() => {
+            if (pathDone) { clearInterval(check); res(); }
+        }, 100);
+    });
+
+    console.log('Starting autonomous loop...');
+
     while (true) {
         await new Promise(res => setTimeout(res, 100));
-
-        if (!me.id) continue;
 
         // DECISION 1: Not carrying anything — find nearest free parcel
         if (me.carrying.length === 0) {
@@ -142,9 +158,15 @@ async function main() {
                 .sort((a, b) => distance(me, a) - distance(me, b))[0];
 
             if (!nearest) {
-                console.log('No parcels available.');
-                continue;
-            }
+        // No parcels visible — go patrol nearest spawner
+        const nearestSpawner = [...spawnerTiles]
+            .sort((a, b) => distance(me, a) - distance(me, b))[0];
+        if (nearestSpawner) {
+            console.log(`No parcels, exploring spawner at (${nearestSpawner.x},${nearestSpawner.y})`);
+            await blindMove(nearestSpawner);
+        }
+        continue;
+    }
 
             console.log(`Heading to parcel ${nearest.id} at (${nearest.x},${nearest.y})`);
 
@@ -161,7 +183,7 @@ async function main() {
                 .sort((a, b) => distance(me, a) - distance(me, b))[0];
 
             if (!nearestDelivery) {
-                console.log('No delivery tiles known yet.');
+                // console.log('No delivery tiles known yet.');
                 continue;
             }
 
