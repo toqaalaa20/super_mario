@@ -8,7 +8,11 @@ export const beliefs = {
 
 export function updateFromSensing({ me, parcels, agents }) {
     if (me) {
-        beliefs.me = me;
+        beliefs.me = {
+            ...me,
+            x: Math.round(me.x),
+            y: Math.round(me.y),
+        };
         beliefs.carrying = me.carrying ?? [];
     }
 

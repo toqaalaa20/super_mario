@@ -1,19 +1,24 @@
 // src/executor.js
-import { beliefs } from './beliefs.js';
+import { beliefs, freeParcels } from './beliefs.js';
 import { INTENTION } from './intentions.js';
 import { aStar } from './astar.js';
+import { explorePath, markVisited } from './explorer.js';
+
+// Snap fractional coords to nearest integer (agent mid-step)
+function snapPosition(me) {
+    return { ...me, x: Math.round(me.x), y: Math.round(me.y) };
+}
 
 export async function executePlan(socket, intention) {
-    const me = beliefs.me;
+    let me = snapPosition(beliefs.me);
     if (!me || !intention) return;
 
     if (intention.type === INTENTION.PICKUP) {
         const path = aStar(me, intention.target);
         for (const dir of path) {
             const ok = await socket.emitMove(dir);
-            if (!ok) return false; // Path blocked or move failed
+            if (!ok) return false;
         }
-        // Arrived at target
         const picked = await socket.emitPickup();
         return picked && picked.length > 0;
     }
@@ -24,15 +29,21 @@ export async function executePlan(socket, intention) {
             const ok = await socket.emitMove(dir);
             if (!ok) return false;
         }
-        // Arrived at target
         await socket.emitPutdown();
         return true;
     }
 
     if (intention.type === INTENTION.EXPLORE) {
-        const dirs = ['up', 'down', 'left', 'right'];
-        const randomDir = dirs[Math.floor(Math.random() * 4)];
-        await socket.emitMove(randomDir);
+        const path = explorePath(me); // pass snapped position
+        if (path.length === 0) return false;
+
+        // Walk the entire computed path without recomputing mid-way
+        for (const dir of path) {
+            if (freeParcels().some(p => p.reward > 5)) return false;
+            const ok = await socket.emitMove(dir);
+            if (!ok) return false;
+            markVisited(Math.round(beliefs.me.x), Math.round(beliefs.me.y));
+        }
         return true;
     }
 }
