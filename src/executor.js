@@ -30,6 +30,7 @@ export async function executePlan(socket, intention) {
             if (!ok) return false;
         }
         await socket.emitPutdown();
+        beliefs.carrying = []; // Clear carrying list after delivery
         return true;
     }
 

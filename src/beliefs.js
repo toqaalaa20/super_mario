@@ -6,7 +6,7 @@ export const beliefs = {
     carrying: [], // parcel ids this agent is currently holding
 };
 
-export function updateFromSensing({ me, parcels, agents }) {
+export function updateFromSensing({ parcels, agents }) {
     for (const p of parcels ?? []) {
         if (p.carriedBy === beliefs.me?.id){
             if (!beliefs.carrying.includes(p.id)) {
