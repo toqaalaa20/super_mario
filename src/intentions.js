@@ -1,4 +1,4 @@
-import { beliefs, freeParcels, deliveryTiles } from './beliefs.js';
+import { beliefs, freeParcels, deliveryTiles, totalCarriedReward } from './beliefs.js';
 import { manhattan } from './utils.js';
 
 export const INTENTION = {
@@ -19,16 +19,40 @@ export function reviseIntention() {
 
     let nextIntention = null;
 
-    // 1. Carrying parcels -> find nearest delivery tile
     if (beliefs.carrying.length > 0) {
-        const nearest = deliveryTiles()
+        const nearestDelivery = deliveryTiles()
             .sort((a, b) => manhattan(me, a) - manhattan(me, b))[0];
-        if (nearest) {
-            nextIntention = { type: INTENTION.DELIVER, target: nearest };
+
+        // Live reward sum — decays each tick as sensing updates carriedParcels
+        const carried = totalCarriedReward();
+
+        // Score for delivering now: what we have / steps to delivery
+        const deliverScore = nearestDelivery
+            ? carried / (manhattan(me, nearestDelivery) + 1)
+            : 0;
+
+        // Score for diverting: (carried + new parcel) / (steps to parcel + steps to delivery)
+        const bestPickup = freeParcels()
+            .filter(p => p.reward > 5)
+            .map(p => {
+                const distToParcel = manhattan(me, p);
+                const distToDelivery = nearestDelivery
+                    ? manhattan(p, nearestDelivery)
+                    : Infinity;
+                const score = (carried + p.reward) / (distToParcel + distToDelivery + 1);
+                return { parcel: p, score };
+            })
+            .sort((a, b) => b.score - a.score)[0];
+
+        // Divert only if combined score is clearly better (1.5x threshold avoids thrashing)
+        if (bestPickup && bestPickup.score > deliverScore * 1.5) {
+            nextIntention = { type: INTENTION.PICKUP, target: bestPickup.parcel };
+        } else if (nearestDelivery) {
+            nextIntention = { type: INTENTION.DELIVER, target: nearestDelivery };
         }
     }
 
-    // 2. No parcels carried? -> Free parcels visible -> pick best reward/distance ratio
+    // 2. Not carrying -> go for best visible free parcel
     if (!nextIntention) {
         const candidates = freeParcels()
             .filter(p => p.reward > 5)
@@ -39,25 +63,29 @@ export function reviseIntention() {
             });
 
         if (candidates.length > 0) {
-            const best = candidates[0];
-            nextIntention = { type: INTENTION.PICKUP, target: best };
+            nextIntention = { type: INTENTION.PICKUP, target: candidates[0] };
         }
     }
 
-    // 3. Nothing visible or useful -> explore
+    // 3. Nothing useful -> explore
     if (!nextIntention) {
         nextIntention = { type: INTENTION.EXPLORE, target: null };
     }
 
-    // --- Logging Switch Logic ---
-    const changed = !current || 
-                    current.type !== nextIntention.type || 
-                    (current.target?.id !== nextIntention.target?.id) ||
-                    (current.target?.x !== nextIntention.target?.x || current.target?.y !== nextIntention.target?.y);
+    const changed =
+        !current ||
+        current.type !== nextIntention.type ||
+        current.target?.id !== nextIntention.target?.id ||
+        current.target?.x !== nextIntention.target?.x ||
+        current.target?.y !== nextIntention.target?.y;
 
     if (changed) {
-        console.log(`[INTENTION] Switch: ${current?.type || 'NONE'} -> ${nextIntention.type}`, 
-            nextIntention.target ? `(Target: ${nextIntention.target.x}, ${nextIntention.target.y})` : '');
+        console.log(
+            `[INTENTION] ${current?.type || 'NONE'} -> ${nextIntention.type}`,
+            nextIntention.target
+                ? `(target: ${nextIntention.target.x},${nextIntention.target.y})`
+                : ''
+        );
         current = nextIntention;
     }
 }

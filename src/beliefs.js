@@ -1,40 +1,56 @@
 export const beliefs = {
     me: null,
-    map: [], // full tile array, received once on connect
-    parcels: new Map(), // id -> { id, x, y, reward, carriedBy }
-    agents: new Map(), // id -> { id, name, x, y, score }
-    carrying: [], // parcel ids this agent is currently holding
+    map: [],                // full tile array, received once on connect
+    parcels: new Map(),     // id -> { id, x, y, reward, carriedBy } — free parcels only
+    carriedParcels: new Map(), // id -> { id, reward, ... } — parcels we hold, live reward from sensing
+    agents: new Map(),      // id -> { id, name, x, y, score }
+    carrying: [],           // parcel ids this agent is currently holding
 };
-
+let sensingTick = 0;
 export function updateFromSensing({ parcels, agents }) {
+    sensingTick++;
+
     for (const p of parcels ?? []) {
-        if (p.carriedBy === beliefs.me?.id){
+        if (p.carriedBy === beliefs.me?.id) {
             if (!beliefs.carrying.includes(p.id)) {
                 beliefs.carrying.push(p.id);
             }
-            beliefs.parcels.delete(p.id); // remove from visible parcels if now carrying
+            beliefs.carriedParcels.set(p.id, p);
+            beliefs.parcels.delete(p.id);
         } else if (!p.carriedBy) {
             if (p.reward > 0) {
-                beliefs.parcels.set(p.id, p);
+                beliefs.parcels.set(p.id, { ...p, _lastSeen: sensingTick });
             } else {
-                beliefs.parcels.delete(p.id); // parcel expired
+                beliefs.parcels.delete(p.id);
             }
         } else {
-            beliefs.parcels.delete(p.id); // carried by someone else, not visible
+            beliefs.parcels.delete(p.id);
+        }
+    }
+
+    // Evict parcels not seen in the last tick — they left sensing range
+    // or were picked up by someone else without an explicit update
+    for (const [id, p] of beliefs.parcels) {
+        if (p._lastSeen < sensingTick) {
+            beliefs.parcels.delete(id);
         }
     }
 
     for (const a of agents ?? []) {
-            beliefs.agents.set(a.id, a);
+        beliefs.agents.set(a.id, a);
     }
-
-    console.log('beliefs.me', beliefs.me);
-    console.log('beliefs.parcels', [...beliefs.parcels.values()]);
-    console.log('beliefs.carrying', beliefs.carrying);
 }
 
 export function setMap(tiles) {
     beliefs.map = tiles;
+}
+
+// Returns the sum of live (decaying) rewards for all parcels we're carrying
+export function totalCarriedReward() {
+    return beliefs.carrying.reduce((sum, id) => {
+        const p = beliefs.carriedParcels.get(id);
+        return sum + (p?.reward ?? 0);
+    }, 0);
 }
 
 // Helpers used by other modules
@@ -43,19 +59,17 @@ export function isWalkable(x, y, fromX, fromY) {
     if (!tile) return false;
     if (tile.type === '0') return false;
 
-    // Check one-way tiles
     const dx = x - fromX;
     const dy = y - fromY;
-    if (tile.type === '←' && dx > 0) return false; // moving right into left-only tile
-    if (tile.type === '→' && dx < 0) return false; // moving left into right-only tile
-    if (tile.type === '↑' && dy < 0) return false; // moving down into up-only tile
-    if (tile.type === '↓' && dy > 0) return false; // moving up into down-only tile
+    if (tile.type === '←' && dx > 0) return false;
+    if (tile.type === '→' && dx < 0) return false;
+    if (tile.type === '↑' && dy < 0) return false;
+    if (tile.type === '↓' && dy > 0) return false;
 
     return true;
 }
 
 export function deliveryTiles() {
-    // type 2 is usually delivery in Deliveroo JS
     return beliefs.map.filter((t) => t.delivery === true || t.type === '2');
 }
 

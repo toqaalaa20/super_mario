@@ -1,11 +1,11 @@
-// index.js (Modified section)
+// src/index.js
 import { DjsConnect } from '@unitn-asa/deliveroo-js-sdk';
 import dotenv from 'dotenv';
 dotenv.config();
 
 import { beliefs, updateFromSensing, setMap } from './beliefs.js';
 import { reviseIntention, getCurrentIntention } from './intentions.js';
-import { executePlan } from './executor.js'; // New import
+import { executePlan } from './executor.js';
 
 const socket = new DjsConnect(
     process.env.DELIVEROO_HOST || 'http://localhost:8080',
@@ -19,15 +19,23 @@ socket.on('map', (width, height, tiles) => {
     console.log('Map loaded');
 });
 
-// Main Loop
+let running = false;
+
 socket.onSensing(async (sensing) => {
     updateFromSensing(sensing);
-    reviseIntention();
-    
-    const intent = getCurrentIntention();
-    if (intent) {
-        // Execute the plan using A* pathfinding
-        await executePlan(socket, intent);
+
+    if (running) return; // don't stack ticks if an action is still in progress
+    running = true;
+
+    try {
+        reviseIntention();
+        const intent = getCurrentIntention();
+        console.log('Current intention:', intent);
+        if (intent) await executePlan(socket, intent);
+    } catch (err) {
+        console.error('[AGENT ERROR]', err.message);
+    } finally {
+        running = false;
     }
 });
 
