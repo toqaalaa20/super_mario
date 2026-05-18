@@ -1,5 +1,5 @@
 // src/executor.js
-import { beliefs, freeParcels } from './beliefs.js';
+import { beliefs, freeParcels, isWalkable } from './beliefs.js';
 import { INTENTION } from './intentions.js';
 import { aStar } from './astar.js';
 import { explorePath, markVisited } from './explorer.js';
@@ -15,6 +15,17 @@ let cachedIntentionKey = null;
 
 function intentionKey(intention) {
     return `${intention.type}:${intention.target?.id ?? intention.target?.x + ',' + intention.target?.y ?? 'null'}`;
+}
+
+function dirToDelta(dir) {
+    return { up: [0,1], down: [0,-1], left: [-1,0], right: [1,0] }[dir];
+}
+
+function perpendiculars(dir) {
+    const perp = { up: ['left','right'], down: ['left','right'],
+                   left: ['up','down'],  right: ['up','down'] };
+    // Shuffle so the agent doesn't always prefer the same side
+    return perp[dir].sort(() => Math.random() - 0.5);
 }
 
 export async function executePlan(socket, intention) {
@@ -49,10 +60,20 @@ export async function executePlan(socket, intention) {
         const dir = cachedPath.shift();
         const ok = await socket.emitMove(dir);
         if (!ok) {
-            // Blocked (likely by another agent) — discard plan, replan next tick
-            console.log('[EXECUTOR] Blocked during EXPLORE, replanning next tick');
+            console.log(`[EXECUTOR] Blocked during ${intention.type}, attempting dodge`);
             cachedPath = [];
             cachedIntentionKey = null;
+        
+            // Try a random perpendicular move to get unstuck
+            const perp = perpendiculars(dir);
+            for (const d of perp) {
+                const me = snapPosition(beliefs.me);
+                const [dx, dy] = dirToDelta(d);
+                if (isWalkable(me.x + dx, me.y + dy, me.x, me.y)) {
+                    await socket.emitMove(d);
+                    break;
+                }
+            }
             return false;
         }
         markVisited(Math.round(beliefs.me.x), Math.round(beliefs.me.y));
@@ -78,11 +99,20 @@ export async function executePlan(socket, intention) {
         const dir = cachedPath.shift();
         const ok = await socket.emitMove(dir);
         if (!ok) {
-            // Blocked by another agent — discard plan, A* will replan next tick
-            // around the agent's new position
-            console.log(`[EXECUTOR] Blocked during ${intention.type}, replanning next tick`);
+            console.log(`[EXECUTOR] Blocked during ${intention.type}, attempting dodge`);
             cachedPath = [];
             cachedIntentionKey = null;
+        
+            // Try a random perpendicular move to get unstuck
+            const perp = perpendiculars(dir);
+            for (const d of perp) {
+                const me = snapPosition(beliefs.me);
+                const [dx, dy] = dirToDelta(d);
+                if (isWalkable(me.x + dx, me.y + dy, me.x, me.y)) {
+                    await socket.emitMove(d);
+                    break;
+                }
+            }
             return false;
         }
         return true;

@@ -66,6 +66,11 @@ export function isWalkable(x, y, fromX, fromY) {
     if (tile.type === '↑' && dy < 0) return false;
     if (tile.type === '↓' && dy > 0) return false;
 
+    // Treat other agents as obstacles
+    for (const a of beliefs.agents.values()) {
+        if (Math.round(a.x) === x && Math.round(a.y) === y) return false;
+    }
+
     return true;
 }
 
