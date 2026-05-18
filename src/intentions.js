@@ -23,15 +23,12 @@ export function reviseIntention() {
         const nearestDelivery = deliveryTiles()
             .sort((a, b) => manhattan(me, a) - manhattan(me, b))[0];
 
-        // Live reward sum — decays each tick as sensing updates carriedParcels
         const carried = totalCarriedReward();
 
-        // Score for delivering now: what we have / steps to delivery
         const deliverScore = nearestDelivery
             ? carried / (manhattan(me, nearestDelivery) + 1)
             : 0;
 
-        // Score for diverting: (carried + new parcel) / (steps to parcel + steps to delivery)
         const bestPickup = freeParcels()
             .filter(p => p.reward > 5)
             .map(p => {
@@ -39,13 +36,26 @@ export function reviseIntention() {
                 const distToDelivery = nearestDelivery
                     ? manhattan(p, nearestDelivery)
                     : Infinity;
+
+                // "On the way" bonus: if picking up this parcel doesn't increase
+                // total travel distance much, it's almost free
+                const directDist = nearestDelivery
+                    ? manhattan(me, nearestDelivery)
+                    : Infinity;
+                const detour = (distToParcel + distToDelivery) - directDist;
+
                 const score = (carried + p.reward) / (distToParcel + distToDelivery + 1);
-                return { parcel: p, score };
+                return { parcel: p, score, detour, distToParcel };
             })
+            // Also grab parcels that are very close (≤3 tiles) regardless of score
+            .filter(({ score, detour, distToParcel }) =>
+                score > deliverScore
+                || distToParcel <= 3        // nearby parcels are almost free to grab
+                || detour <= 2             // on the way — tiny detour
+            )
             .sort((a, b) => b.score - a.score)[0];
 
-        // Divert only if combined score is clearly better (1.5x threshold avoids thrashing)
-        if (bestPickup && bestPickup.score > deliverScore * 1.5) {
+        if (bestPickup) {
             nextIntention = { type: INTENTION.PICKUP, target: bestPickup.parcel };
         } else if (nearestDelivery) {
             nextIntention = { type: INTENTION.DELIVER, target: nearestDelivery };

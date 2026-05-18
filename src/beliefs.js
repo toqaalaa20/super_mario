@@ -11,7 +11,7 @@ export function updateFromSensing({ parcels, agents }) {
     sensingTick++;
 
     for (const p of parcels ?? []) {
-        if (p.carriedBy === beliefs.me?.id) {
+        if (p.carriedBy === beliefs.me?.id) { // we're carrying this parcel
             if (!beliefs.carrying.includes(p.id)) {
                 beliefs.carrying.push(p.id);
             }

@@ -31,6 +31,12 @@ socket.onSensing(async (sensing) => {
         reviseIntention();
         const intent = getCurrentIntention();
         console.log('Current intention:', intent);
+        console.log('Beliefs:', {
+            me: beliefs.me,
+            parcels: Array.from(beliefs.parcels.values()),
+            carrying: beliefs.carrying,
+            carriedParcels: beliefs.carriedParcels,        
+        });
         if (intent) await executePlan(socket, intent);
     } catch (err) {
         console.error('[AGENT ERROR]', err.message);
