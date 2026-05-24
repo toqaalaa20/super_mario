@@ -59,7 +59,6 @@ socket.onSensing(async (sensing) => {
     try {
         reviseIntention();
         const intent = getCurrentIntention();
-        console.log('[BDI] Intention:', intent?.type, intent?.target ?? '');
         if (intent) await executePlan(socket, intent);
     } catch (err) {
         console.error('[BDI ERROR]', err.message);

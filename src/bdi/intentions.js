@@ -35,15 +35,6 @@ function parcelAllowed(parcel) {
     return true;
 }
 
-/** Apply AVOID_TILE: exclude a specific tile from delivery candidates */
-function tileAllowed(tile) {
-    if (missionState.active && missionState.type === 'AVOID_TILE') {
-        const { x, y } = missionState.params;
-        if (tile.x === x && tile.y === y) return false;
-    }
-    return true;
-}
-
 /** Apply PREFERRED_DELIVERY: sort preferred tiles first */
 function sortDeliveryTiles(tiles, me) {
     if (missionState.active && missionState.type === 'PREFERRED_DELIVERY') {
@@ -80,7 +71,7 @@ export function reviseIntention() {
 
     // ── 1. Carrying parcels ──────────────────────────────────────────────────
     if (beliefs.carrying.length > 0) {
-        const allDelivery = deliveryTiles().filter(tileAllowed);
+        const allDelivery = deliveryTiles();
         const sortedDelivery = sortDeliveryTiles(allDelivery, me);
         const nearestDelivery = sortedDelivery[0];
         const carried = totalCarriedReward();
@@ -170,13 +161,13 @@ export function reviseIntention() {
         current.target?.y !== nextIntention.target?.y;
 
     if (changed) {
-        console.log(
-            `[INTENTION] ${current?.type || 'NONE'} -> ${nextIntention.type}`,
-            nextIntention.target
-                ? `(target: ${nextIntention.target.x},${nextIntention.target.y})`
-                : '',
-            missionState.active ? `[MISSION: ${missionState.description}]` : '',
-        );
+        // console.log(
+        //     `[INTENTION] ${current?.type || 'NONE'} -> ${nextIntention.type}`,
+        //     nextIntention.target
+        //         ? `(target: ${nextIntention.target.x},${nextIntention.target.y})`
+        //         : '',
+        //     missionState.active ? `[MISSION: ${missionState.description}]` : '',
+        // );
         current = nextIntention;
     }
 }

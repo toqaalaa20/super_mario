@@ -1,4 +1,3 @@
-// src/explorer.js
 import { beliefs, isWalkable } from './beliefs.js';
 import { aStar } from './astar.js';
 import { manhattan } from './utils.js';
@@ -75,8 +74,6 @@ export function getExploreTarget(me) {         // ← add me param
 }
 
 export function explorePath(me) {             
-    console.log('[EXPLORE] map size:', beliefs.map.length);
-    console.log('[EXPLORE] me:', me);
     if (!me) return [];
 
     markVisited(me.x, me.y);
@@ -85,15 +82,12 @@ export function explorePath(me) {
         if (!isWalkable(t.x, t.y, t.x, t.y)) return false;
         return !visited.has(key(t.x, t.y));
     });
-    console.log('[EXPLORE] frontier size:', frontier.length);
 
     const target = getExploreTarget(me);
-    console.log('[EXPLORE] target:', target);
 
     if (!target) return [];
 
     const path = aStar(me, target);
-    console.log('[EXPLORE] path:', path);
 
     if (path.length === 0) {
         const dirs = [

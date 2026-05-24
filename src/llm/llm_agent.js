@@ -137,7 +137,7 @@ async function sendMissionToBDI(args) {
             params: parsed.params ?? {},
             description: parsed.description ?? '',
         });
-        await socket.emitSay(cmd);
+        await socket.emitShout(cmd);
         console.log('[LLM] Mission command sent to BDI:', cmd);
         return `Mission sent to BDI agent: ${parsed.description}`;
     } catch (e) {

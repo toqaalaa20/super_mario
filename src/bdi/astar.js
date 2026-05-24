@@ -1,8 +1,15 @@
-// src/astar.js
 import { isWalkable } from './beliefs.js';
+import { missionState } from './intentions.js';
 
 const key = (x, y) => `${x},${y}`;
 const h = (a, b) => Math.abs(a.x - b.x) + Math.abs(a.y - b.y);
+
+function isAvoidedTile(x, y) {
+    if (missionState.active && missionState.type === 'AVOID_TILE') {
+        return x === missionState.params.x && y === missionState.params.y;
+    }
+    return false;
+}
 
 export function aStar(from, to) {
     const open = [{ x: from.x, y: from.y, g: 0, f: h(from, to), parent: null }];
@@ -27,10 +34,9 @@ export function aStar(from, to) {
             const nx = node.x + dx;
             const ny = node.y + dy;
 
-            // Check map boundaries and walkability (including one-way tiles)
-            if (!isWalkable(nx, ny, node.x, node.y) || closed.has(key(nx, ny))) {
-                continue;
-            }
+            // Check map boundaries, walkability, and avoided tiles
+            if (!isWalkable(nx, ny, node.x, node.y) || closed.has(key(nx, ny))) continue;
+            if (isAvoidedTile(nx, ny)) continue;
 
             const g = node.g + 1;
             open.push({

@@ -1,4 +1,3 @@
-// src/executor.js
 import { beliefs, freeParcels, isWalkable } from './beliefs.js';
 import { INTENTION } from './intentions.js';
 import { aStar } from './astar.js';
