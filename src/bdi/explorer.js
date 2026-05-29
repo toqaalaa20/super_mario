@@ -5,6 +5,18 @@ import { manhattan } from './utils.js';
 // tile key -> { visitCount, lastVisited (ms timestamp) }
 const visited = new Map();
 const key = (x, y) => `${x},${y}`;
+const recentTrail = [];
+const RECENT_TRAIL_LIMIT = 6;
+
+function rememberRecent(k) {
+    if (recentTrail[recentTrail.length - 1] === k) return;
+    recentTrail.push(k);
+    if (recentTrail.length > RECENT_TRAIL_LIMIT) recentTrail.shift();
+}
+
+function recentKeys() {
+    return new Set(recentTrail);
+}
 
 // Call this once per sensing cycle to record where the agent is
 export function markVisited(x, y) {
@@ -14,6 +26,7 @@ export function markVisited(x, y) {
         visitCount: prev.visitCount + 1,
         lastVisited: Date.now(),
     });
+    rememberRecent(k);
 }
 
 // Frontier = walkable map tiles that have never been visited
@@ -44,8 +57,9 @@ function getFrontierTiles() {
 
 // If the entire map is visited, reset the N least-recently visited tiles
 // so the agent keeps exploring after full coverage
-function resetOldestTiles(n = 20) {
+function resetOldestTiles(n = 20, protectedKeys = new Set()) {
     const sorted = [...visited.entries()]
+        .filter(([k]) => !protectedKeys.has(k))
         .sort(([, a], [, b]) => a.lastVisited - b.lastVisited)
         .slice(0, n);
     for (const [k] of sorted) visited.delete(k);
@@ -64,7 +78,14 @@ export function getExploreTarget(me) {         // ← add me param
     let frontier = getFrontierTiles();
 
     if (frontier.length === 0) {
-        resetOldestTiles(20);
+        resetOldestTiles(20, recentKeys());
+        frontier = getFrontierTiles();
+    }
+
+    // On very small or fully constrained maps, the recent trail may cover every
+    // candidate. Keep the current tile protected, but allow older trail tiles.
+    if (frontier.length === 0) {
+        resetOldestTiles(20, new Set([key(me.x, me.y)]));
         frontier = getFrontierTiles();
     }
 
@@ -87,13 +108,17 @@ export function explorePath(me) {
 
     if (path.length === 0) {
         const dirs = [
-            [0, -1, 'up'], [0, 1, 'down'], [-1, 0, 'left'], [1, 0, 'right']
+            [0, 1, 'up'], [0, -1, 'down'], [-1, 0, 'left'], [1, 0, 'right']
         ];
         const walkable = dirs.filter(([dx, dy]) =>
             isWalkable(me.x + dx, me.y + dy, me.x, me.y)
         );
-        if (walkable.length > 0) {
-            const [,, dir] = walkable[Math.floor(Math.random() * walkable.length)];
+        const notRecent = walkable.filter(([dx, dy]) =>
+            !recentKeys().has(key(me.x + dx, me.y + dy))
+        );
+        const candidates = notRecent.length > 0 ? notRecent : walkable;
+        if (candidates.length > 0) {
+            const [,, dir] = candidates[Math.floor(Math.random() * candidates.length)];
             return [dir];
         }
     }

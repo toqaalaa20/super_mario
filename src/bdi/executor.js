@@ -11,6 +11,7 @@ function snapPosition(me) {
 // Cached plan — reused across ticks until intention changes or a move fails
 let cachedPath = [];
 let cachedIntentionKey = null;
+let lastExploreStep = null;
 
 function intentionKey(intention) {
     return `${intention.type}:${intention.target?.id ?? intention.target?.x + ',' + intention.target?.y ?? 'null'}`;
@@ -18,6 +19,27 @@ function intentionKey(intention) {
 
 function dirToDelta(dir) {
     return { up: [0,1], down: [0,-1], left: [-1,0], right: [1,0] }[dir];
+}
+
+function positionKey(pos) {
+    return `${pos.x},${pos.y}`;
+}
+
+function nextPosition(me, dir) {
+    const [dx, dy] = dirToDelta(dir);
+    return { x: me.x + dx, y: me.y + dy };
+}
+
+function nonBacktrackingDirections(me, previousPositionKey) {
+    return ['up', 'down', 'left', 'right'].filter(dir => {
+        const next = nextPosition(me, dir);
+        return positionKey(next) !== previousPositionKey &&
+            isWalkable(next.x, next.y, me.x, me.y);
+    });
+}
+
+function rememberMove(to) {
+    Object.assign(beliefs.me, to);
 }
 
 function perpendiculars(dir) {
@@ -46,6 +68,10 @@ export async function executePlan(socket, intention) {
         }
     }
 
+    if (intention.type !== INTENTION.EXPLORE) {
+        lastExploreStep = null;
+    }
+
     // --- EXPLORE: one step at a time, abort if a parcel appears ---
     if (intention.type === INTENTION.EXPLORE) {
         if (cachedPath.length === 0) return false;
@@ -56,7 +82,23 @@ export async function executePlan(socket, intention) {
             return false;
         }
 
-        const dir = cachedPath.shift();
+        let dir = cachedPath.shift();
+
+        if (
+            lastExploreStep &&
+            positionKey(me) === lastExploreStep.to &&
+            positionKey(nextPosition(me, dir)) === lastExploreStep.from
+        ) {
+            const alternatives = nonBacktrackingDirections(me, lastExploreStep.from);
+            if (alternatives.length > 0) {
+                cachedPath = [];
+                cachedIntentionKey = null;
+                dir = alternatives[Math.floor(Math.random() * alternatives.length)];
+            }
+        }
+
+        const from = positionKey(me);
+        const to = positionKey(nextPosition(me, dir));
         const ok = await socket.emitMove(dir);
         if (!ok) {
             console.log(`[EXECUTOR] Blocked during ${intention.type}, attempting dodge`);
@@ -69,13 +111,21 @@ export async function executePlan(socket, intention) {
                 const me = snapPosition(beliefs.me);
                 const [dx, dy] = dirToDelta(d);
                 if (isWalkable(me.x + dx, me.y + dy, me.x, me.y)) {
-                    await socket.emitMove(d);
+                    const dodgeFrom = positionKey(me);
+                    const dodgeTo = positionKey(nextPosition(me, d));
+                    const dodged = await socket.emitMove(d);
+                    if (dodged) {
+                        lastExploreStep = { from: dodgeFrom, to: dodgeTo };
+                        rememberMove(nextPosition(me, d));
+                    }
                     break;
                 }
             }
             return false;
         }
-        markVisited(Math.round(beliefs.me.x), Math.round(beliefs.me.y));
+        lastExploreStep = { from, to };
+        rememberMove(nextPosition(me, dir));
+        markVisited(nextPosition(me, dir).x, nextPosition(me, dir).y);
         return true;
     }
 
@@ -96,6 +146,7 @@ export async function executePlan(socket, intention) {
         }
 
         const dir = cachedPath.shift();
+        const next = nextPosition(me, dir);
         const ok = await socket.emitMove(dir);
         if (!ok) {
             console.log(`[EXECUTOR] Blocked during ${intention.type}, attempting dodge`);
@@ -108,12 +159,14 @@ export async function executePlan(socket, intention) {
                 const me = snapPosition(beliefs.me);
                 const [dx, dy] = dirToDelta(d);
                 if (isWalkable(me.x + dx, me.y + dy, me.x, me.y)) {
-                    await socket.emitMove(d);
+                    const dodged = await socket.emitMove(d);
+                    if (dodged) rememberMove(nextPosition(me, d));
                     break;
                 }
             }
             return false;
         }
+        rememberMove(next);
         return true;
     }
 }
