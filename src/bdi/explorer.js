@@ -19,6 +19,7 @@ export function markVisited(x, y) {
 // Frontier = walkable map tiles that have never been visited
 function getFrontierTiles() {
     return beliefs.map.filter(t => {
+        if (t.type !== '1') return false;
         if (!isWalkable(t.x, t.y, t.x, t.y)) return false; // tile itself must be walkable
         if (visited.has(key(t.x, t.y))) return false;
 
@@ -77,11 +78,6 @@ export function explorePath(me) {
     if (!me) return [];
 
     markVisited(me.x, me.y);
-
-    const frontier = beliefs.map.filter(t => {
-        if (!isWalkable(t.x, t.y, t.x, t.y)) return false;
-        return !visited.has(key(t.x, t.y));
-    });
 
     const target = getExploreTarget(me);
 
