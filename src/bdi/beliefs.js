@@ -36,6 +36,10 @@ export function updateFromSensing({ parcels, agents }) {
         }
     }
 
+    const seenAgentIds = new Set((agents ?? []).map(a => a.id));
+    for (const id of beliefs.agents.keys()) {
+        if (!seenAgentIds.has(id)) beliefs.agents.delete(id);
+    }
     for (const a of agents ?? []) {
         beliefs.agents.set(a.id, a);
     }

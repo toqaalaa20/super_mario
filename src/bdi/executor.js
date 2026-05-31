@@ -14,7 +14,7 @@ let cachedIntentionKey = null;
 let lastExploreStep = null;
 
 function intentionKey(intention) {
-    return `${intention.type}:${intention.target?.id ?? intention.target?.x + ',' + intention.target?.y ?? 'null'}`;
+    return `${intention.type}:${intention.target?.id ?? (intention.target ? `${intention.target.x},${intention.target.y}` : 'null')}`;
 }
 
 function dirToDelta(dir) {
@@ -108,7 +108,6 @@ export async function executePlan(socket, intention) {
             // Try a random perpendicular move to get unstuck
             const perp = perpendiculars(dir);
             for (const d of perp) {
-                const me = snapPosition(beliefs.me);
                 const [dx, dy] = dirToDelta(d);
                 if (isWalkable(me.x + dx, me.y + dy, me.x, me.y)) {
                     const dodgeFrom = positionKey(me);
@@ -156,7 +155,6 @@ export async function executePlan(socket, intention) {
             // Try a random perpendicular move to get unstuck
             const perp = perpendiculars(dir);
             for (const d of perp) {
-                const me = snapPosition(beliefs.me);
                 const [dx, dy] = dirToDelta(d);
                 if (isWalkable(me.x + dx, me.y + dy, me.x, me.y)) {
                     const dodged = await socket.emitMove(d);
