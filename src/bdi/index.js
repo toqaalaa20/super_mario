@@ -11,7 +11,10 @@ const socket = new DjsConnect(
     process.env.BDI_TOKEN,
 );
 
-socket.onConnect(() => console.log('[BDI] Connected to Deliveroo'));
+socket.onConnect(() => {
+    console.log('[BDI] Connected to Deliveroo');
+    setTimeout(() => socket.emitShout(JSON.stringify({ cmd: 'HELLO' })), 1000);
+});
 
 socket.on('map', (width, height, tiles) => {
     setMap(tiles);
@@ -22,11 +25,29 @@ socket.on('map', (width, height, tiles) => {
 
 socket.onMsg((id, name, msg) => {
     if (id === beliefs.me?.id) return;
+    if (name === process.env.LLM_AGENT_NAME && !llmAgentId) {
+        llmAgentId = id;
+        console.log('[BDI] Learned LLM agent ID:', llmAgentId);
+    }
     try {
         const parsed = JSON.parse(msg);
 
+        if (parsed.cmd === 'HELLO' && name === process.env.LLM_AGENT_NAME) {
+            llmAgentId = id;
+            console.log('[BDI] Learned LLM agent ID from handshake:', llmAgentId);
+            return;
+        }
+
         if (parsed.cmd === 'CLAIM' && name === process.env.LLM_AGENT_NAME) {
+            const myIntent = getCurrentIntention();
+            if (myIntent?.type === 'pickup' && myIntent.target?.id === parsed.parcelId) {
+                // BDI is already targeting this parcel — counter-claim so LLM backs off
+                socket.emitSay(id, JSON.stringify({ cmd: 'CLAIM', parcelId: parsed.parcelId }));
+                console.log('[BDI] Counter-claiming', parsed.parcelId, '— already targeting it');
+                return;
+            }
             beliefs.claimedByOther.set(id, parsed.parcelId);
+            console.log('[BDI] Received CLAIM from LLM:', parsed.parcelId);
             return;
         }
 
@@ -55,6 +76,7 @@ socket.onMsg((id, name, msg) => {
 
 let running = false;
 let lastClaimedId = null;
+let llmAgentId = null; // learned from first message received from LLM
 
 socket.onSensing(async (sensing) => {
     updateFromSensing(sensing);
@@ -67,7 +89,12 @@ socket.onSensing(async (sensing) => {
         const intent = getCurrentIntention();
         if (intent?.type === 'pickup' && intent.target?.id !== lastClaimedId) {
             lastClaimedId = intent.target.id;
-            socket.emitShout(JSON.stringify({ cmd: 'CLAIM', parcelId: intent.target.id }));
+            if (llmAgentId) {
+                socket.emitSay(llmAgentId, JSON.stringify({ cmd: 'CLAIM', parcelId: intent.target.id }));
+                console.log('[BDI] Claimed parcel:', intent.target.id, '→ LLM');
+            } else {
+                console.log('[BDI] Claim skipped — LLM ID not yet known');
+            }
         }
         if (intent) await executePlan(socket, intent);
     } catch (err) {

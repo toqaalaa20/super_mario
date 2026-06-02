@@ -25,7 +25,10 @@ const socket = new DjsConnect(
     process.env.LLM_TOKEN,
 );
 
-socket.onConnect(() => console.log('[LLM] Connected to Deliveroo'));
+socket.onConnect(() => {
+    console.log('[LLM] Connected to Deliveroo');
+    setTimeout(() => socket.emitShout(JSON.stringify({ cmd: 'HELLO' })), 1000);
+});
 
 // ─── Local state ──────────────────────────────────────────────────────────────
 
@@ -57,7 +60,12 @@ socket.onSensing(async ({ parcels, agents }) => {
         const intent = getCurrentIntention();
         if (intent?.type === INTENTION.PICKUP && intent.target?.id !== lastClaimedId) {
             lastClaimedId = intent.target.id;
-            socket.emitShout(JSON.stringify({ cmd: 'CLAIM', parcelId: intent.target.id }));
+            if (bdiAgentId) {
+                socket.emitSay(bdiAgentId, JSON.stringify({ cmd: 'CLAIM', parcelId: intent.target.id }));
+                console.log('[LLM] Claimed parcel:', intent.target.id, '→ BDI');
+            } else {
+                console.log('[LLM] Claim skipped — BDI ID not yet known');
+            }
         }
         if (intent) await executePlan(socket, intent);
     } catch (err) {
@@ -126,8 +134,10 @@ async function putdown() {
 }
 
 function getVisibleParcels() {
+    const claimed = new Set(beliefs.claimedByOther.values());
     return JSON.stringify(visibleParcels.map(p => ({
-        id: p.id, x: p.x, y: p.y, reward: p.reward, carriedBy: p.carriedBy ?? null
+        id: p.id, x: p.x, y: p.y, reward: p.reward, carriedBy: p.carriedBy ?? null,
+        claimedByPartner: claimed.has(p.id),
     })));
 }
 
@@ -152,7 +162,7 @@ function getAllWalkableTiles() {
 }
 
 async function sendChatMessage(msg) {
-    await socket.emitSay(msg);
+    await socket.emitShout(msg);
     return `Sent chat message: "${msg}"`;
 }
 
@@ -170,7 +180,8 @@ async function sendMissionToBDI(args) {
             params: parsed.params ?? {},
             description: parsed.description ?? '',
         });
-        await socket.emitShout(cmd);
+        if (bdiAgentId) await socket.emitSay(bdiAgentId, cmd);
+        else await socket.emitShout(cmd); // fallback if BDI not yet seen
         console.log('[LLM] Mission command sent to BDI:', cmd);
         return `Mission sent to BDI agent: ${parsed.description}`;
     } catch (e) {
@@ -180,7 +191,8 @@ async function sendMissionToBDI(args) {
 
 async function clearMissionOnBDI() {
     const cmd = JSON.stringify({ cmd: 'MISSION_CLEAR' });
-    await socket.emitSay(cmd);
+    if (bdiAgentId) await socket.emitSay(bdiAgentId, cmd);
+    else await socket.emitShout(cmd);
     console.log('[LLM] Mission clear sent to BDI');
     return 'Mission cleared on BDI agent.';
 }
@@ -215,7 +227,7 @@ Available tools:
 - move_to(x=N,y=M): navigate to a target tile automatically (multi-step) Input example: x=14, y=12
 - pickup(): pick up parcels at your current position
 - putdown(): put down all carried parcels at your current position
-- get_visible_parcels(): list parcels visible right now
+- get_visible_parcels(): list parcels visible right now (claimedByPartner=true means the BDI agent is already going for it — avoid those)
 - get_delivery_tiles(): list all delivery tiles on the map
 - get_map_info(): map overview
 - get_all_walkable_tiles(): list all walkable tiles with x, y, and whether they are delivery tiles. Use this to find tiles by spatial description (e.g. leftmost = min x, rightmost = max x, topmost = max y, bottommost = min y)
@@ -342,16 +354,28 @@ async function runMissionTurn(userInput, maxIterations = 100) {
 // ─── Chat listener ─────────────────────────────────────────────────────────────
 
 let missionRunning = false;
+let bdiAgentId = null; // learned from first message received from BDI
 
 socket.onMsg(async (id, name, msg) => {
     if (id === me.id) return;
+    if (name === process.env.BDI_AGENT_NAME && !bdiAgentId) {
+        bdiAgentId = id;
+        console.log('[LLM] Learned BDI agent ID:', bdiAgentId);
+    }
     try {
         const p = JSON.parse(msg);
-        if (p.cmd === 'CLAIM' && name === process.env.BDI_AGENT_NAME) {
-            beliefs.claimedByOther.set(id, p.parcelId);
+        if (p.cmd === 'HELLO' && name === process.env.BDI_AGENT_NAME) {
+            bdiAgentId = id;
+            console.log('[LLM] Learned BDI agent ID from handshake:', bdiAgentId);
             return;
         }
-        if (p.cmd) return; // other BDI commands
+
+        if (p.cmd === 'CLAIM' && name === process.env.BDI_AGENT_NAME) {
+            beliefs.claimedByOther.set(id, p.parcelId);
+            console.log('[LLM] Received CLAIM from BDI:', p.parcelId);
+            return;
+        }
+        if (p.cmd) return; // other inter-agent commands
     } catch {}
 
     console.log(`\n[CHAT] ${name}: ${msg}`);
