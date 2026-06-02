@@ -2,8 +2,10 @@ import 'dotenv/config';
 import OpenAI from 'openai';
 import { DjsConnect } from '@unitn-asa/deliveroo-js-sdk';
 import { beliefs, updateFromSensing, setMap } from '../bdi/beliefs.js';
+import { aStar } from '../bdi/astar.js';
 import { reviseIntention, getCurrentIntention, INTENTION, setMissionState } from '../bdi/intentions.js';
 import { executePlan } from '../bdi/executor.js';
+import { explorePath } from '../bdi/explorer.js';
 
 // ─── LLM client ───────────────────────────────────────────────────────────────
 
@@ -85,21 +87,38 @@ function calculate(expression) {
     catch (e) { return `Error: ${e.message}`; }
 }
 
+function snapPosition() {
+    if (me.x === null || me.y === null) return null;
+    return { ...me, x: Math.round(me.x), y: Math.round(me.y) };
+}
+
+async function applyMove(direction) {
+    const result = await socket.emitMove(direction);
+    if (!result) return false;
+    Object.assign(me, { x: result.x, y: result.y });
+    return true;
+}
+
+async function followPath(path, label) {
+    if (!Array.isArray(path) || path.length === 0) {
+        return `Error: no ${label} path found.`;
+    }
+
+    let steps = 0;
+    for (const direction of path) {
+        const ok = await applyMove(direction);
+        if (!ok) {
+            return `Error: blocked while following ${label} path after ${steps} step(s).`;
+        }
+        steps++;
+    }
+
+    return `Completed ${label} path in ${steps} step(s). Current position: (${Math.round(me.x)}, ${Math.round(me.y)}).`;
+}
+
 async function getMyPosition() {
     if (me.x === null) return 'Error: position not available yet.';
     return JSON.stringify({ x: me.x, y: me.y, score: me.score, name: me.name });
-}
-
-async function move(direction) {
-    const d = direction.trim().toLowerCase();
-    if (!['up', 'down', 'left', 'right'].includes(d))
-        return `Error: invalid direction '${direction}'.`;
-    const result = await socket.emitMove(d);
-    if (result) {
-        me.x = result.x; me.y = result.y;
-        return `Moved ${d}. New position: (${me.x}, ${me.y}).`;
-    }
-    return `Error: failed to move ${d}.`;
 }
 
 async function moveTo(args) {
@@ -107,21 +126,21 @@ async function moveTo(args) {
         || args.match(/(-?\d+)[,\s]+(-?\d+)/);
     if (!match) return `Error: could not parse target coordinates from '${args}'.`;
     const tx = parseInt(match[1]), ty = parseInt(match[2]);
-    let steps = 0, maxSteps = 200;
-    while ((Math.round(me.x) !== tx || Math.round(me.y) !== ty) && steps < maxSteps) {
-        const dx = tx - Math.round(me.x);
-        const dy = ty - Math.round(me.y);
-        const dir = Math.abs(dx) >= Math.abs(dy)
-            ? (dx > 0 ? 'right' : 'left')
-            : (dy > 0 ? 'up' : 'down');
-        const result = await socket.emitMove(dir);
-        if (!result) break;
-        me.x = result.x; me.y = result.y;
-        steps++;
+    const current = snapPosition();
+    if (!current) return 'Error: position not available yet.';
+    if (current.x === tx && current.y === ty) {
+        return `Already at (${tx}, ${ty}).`;
     }
-    if (Math.round(me.x) === tx && Math.round(me.y) === ty)
-        return `Reached (${tx}, ${ty}) in ${steps} steps.`;
-    return `Stopped at (${Math.round(me.x)}, ${Math.round(me.y)}) after ${steps} steps. Target was (${tx}, ${ty}).`;
+
+    const path = aStar(current, { x: tx, y: ty });
+    return followPath(path, `A* route to (${tx}, ${ty})`);
+}
+
+async function explore() {
+    const current = snapPosition();
+    if (!current) return 'Error: position not available yet.';
+    const path = explorePath(current);
+    return followPath(path, 'exploration');
 }
 
 async function pickup() {
@@ -247,8 +266,8 @@ async function clearMissionOnBDI() {
 const TOOLS = {
     calculate,
     get_my_position: getMyPosition,
-    move,
     move_to: moveTo,
+    explore,
     pickup,
     putdown,
     get_visible_parcels: getVisibleParcels,
@@ -272,8 +291,8 @@ You can send mission commands to the BDI agent via send_mission_to_bdi to coordi
 Available tools:
 - calculate(expression): evaluate math expressions
 - get_my_position(): get your current (x, y) and score
-- move(direction): move one step — up, down, left, right
-- move_to(x=N,y=M): navigate to a target tile automatically (multi-step) Input example: x=14, y=12
+- move_to(x=N,y=M): navigate to a target tile using the BDI A* planner. Input example: x=14, y=12
+- explore(): use the BDI explorer + A* planner to move toward an unexplored frontier
 - pickup(): pick up parcels at your current position
 - putdown(): put down all carried parcels at your current position
 - get_visible_parcels(): list parcels visible right now (claimedByPartner=true means the BDI agent is already going for it — avoid those)
@@ -297,15 +316,18 @@ Available tools:
 - wait_for_chat_signal(keyword): block until that keyword appears in game chat (e.g. "green"); times out after 2 minutes
 
 Movement rules:
-- move(up) increases y by 1, move(down) decreases y by 1
-- move(right) increases x by 1, move(left) decreases x by 1
 - Use move_to for navigating to specific coordinates.
+- Use explore when you want the agent to keep expanding into unexplored map tiles.
 
 Mission decision rules:
 - Before accepting a mission, evaluate whether it is profitable.
-  * If the mission gives NEGATIVE points or is clearly a trap, reply "Mission declined: not profitable." and stop.
-  * If the mission gives positive points or a reward multiplier, accept it.
-- For Level 1 atomic missions (move, calculate, answer a question, drop a parcel, timed stop): execute them directly with tools above.
+  * Extract any point value mentioned in the mission. Point values can be written in many formats:
+    "-5pts", "-5 pts", "-5 pts.", "-5 points", "minus 5 points", "lose 5pts", "costs 5pts", etc.
+  * If the point value is NEGATIVE (less than zero), ALWAYS decline regardless of formatting.
+    Reply with "Mission declined: not profitable." and give Final Answer immediately. Do NOT call any tools.
+  * If the point value is POSITIVE or the mission gives a reward multiplier, accept and execute it.
+  * If no point value is mentioned, use your judgment based on the mission description.
+- For Level 1 atomic missions (calculate, answer a question, drop a parcel, timed stop): execute them directly with tools above.
   * "Stop for N seconds": call wait_for_chat_signal("green") — the green signal fires automatically after N seconds.
 - For Level 2 persistent missions (e.g. "deliver stacks of 3 to double reward"): call send_mission_to_bdi() to instruct the BDI agent, then give Final Answer immediately.
 - For Level 3 coordination missions:

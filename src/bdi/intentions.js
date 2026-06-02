@@ -59,7 +59,6 @@ function shouldDeliver(me, nearestDelivery) {
     if (missionState.active && missionState.type === 'STACK_SIZE') {
         const required = missionState.params.size ?? 1;
         const ready = beliefs.carrying.length >= required;
-        console.log(`[STACK_SIZE] carrying=${beliefs.carrying.length}/${required} → ${ready ? 'DELIVER' : 'HOLD'}`);
         return ready;
     }
     return true; // default: deliver whenever it's profitable
