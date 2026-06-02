@@ -118,6 +118,13 @@ function getMapInfo() {
     });
 }
 
+function getAllWalkableTiles() {
+    const tiles = mapTiles
+        .filter(t => t.type !== '0')
+        .map(t => ({ x: t.x, y: t.y, delivery: !!(t.delivery || t.type === '2') }));
+    return JSON.stringify(tiles);
+}
+
 async function sendChatMessage(msg) {
     await socket.emitSay(msg);
     return `Sent chat message: "${msg}"`;
@@ -162,6 +169,7 @@ const TOOLS = {
     get_visible_parcels: getVisibleParcels,
     get_delivery_tiles: getDeliveryTiles,
     get_map_info: getMapInfo,
+    get_all_walkable_tiles: getAllWalkableTiles,
     send_chat_message: sendChatMessage,
     send_mission_to_bdi: sendMissionToBDI,
     clear_mission_on_bdi: clearMissionOnBDI,
@@ -184,6 +192,7 @@ Available tools:
 - get_visible_parcels(): list parcels visible right now
 - get_delivery_tiles(): list all delivery tiles on the map
 - get_map_info(): map overview
+- get_all_walkable_tiles(): list all walkable tiles with x, y, and whether they are delivery tiles. Use this to find tiles by spatial description (e.g. leftmost = min x, rightmost = max x, topmost = max y, bottommost = min y)
 - send_chat_message(text): send a plain text message to the game chat
 - send_mission_to_bdi(json): send a Level 2 mission command to the BDI agent.
   The JSON must be: { "type": "STACK_SIZE"|"PREFERRED_DELIVERY"|"AVOID_TILE"|"SCORE_FILTER", "params": {...}, "description": "..." }
@@ -204,7 +213,7 @@ Mission decision rules:
   * If the mission gives NEGATIVE points or is clearly a trap, reply "Mission declined: not profitable." and stop.
   * If the mission gives positive points or a reward multiplier, accept it.
 - For Level 1 atomic missions (move, calculate, answer a question, drop a parcel): execute them directly with tools above.
-- For Level 2 persistent missions (e.g. "deliver stacks of 3 to double reward"): call send_mission_to_bdi() to instruct the BDI agent, then also apply the same strategy yourself.
+- For Level 2 persistent missions (e.g. "deliver stacks of 3 to double reward"): call send_mission_to_bdi() to instruct the BDI agent, then give Final Answer immediately.
 - After completing a mission, call send_chat_message to report the result.
 
 STRICT OUTPUT FORMAT — use exactly one format per message:
