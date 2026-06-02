@@ -2,7 +2,7 @@ import 'dotenv/config';
 import OpenAI from 'openai';
 import { DjsConnect } from '@unitn-asa/deliveroo-js-sdk';
 import { beliefs, updateFromSensing, setMap } from '../bdi/beliefs.js';
-import { reviseIntention, getCurrentIntention } from '../bdi/intentions.js';
+import { reviseIntention, getCurrentIntention, INTENTION } from '../bdi/intentions.js';
 import { executePlan } from '../bdi/executor.js';
 
 // ─── LLM client ───────────────────────────────────────────────────────────────
@@ -10,6 +10,7 @@ import { executePlan } from '../bdi/executor.js';
 const llm = new OpenAI({
     baseURL: process.env.LITELLM_BASE_URL || 'https://llm.bears.disi.unitn.it/v1',
     apiKey: process.env.LITELLM_API_KEY,
+    timeout: 30_000, // 30s — fail fast so retries kick in quickly
 });
 const MODEL = process.env.LOCAL_MODEL || 'llama-3.3-70b-lmstudio';
 
@@ -24,10 +25,7 @@ const socket = new DjsConnect(
     process.env.LLM_TOKEN,
 );
 
-socket.onConnect(() => {
-    console.log('[LLM] Connected to Deliveroo');
-    deliveryLoop();
-});
+socket.onConnect(() => console.log('[LLM] Connected to Deliveroo'));
 
 // ─── Local state ──────────────────────────────────────────────────────────────
 
@@ -45,9 +43,28 @@ socket.on('map', (width, height, tiles) => {
     setMap(tiles);
 });
 
-socket.onSensing(({ parcels, agents }) => {
+let loopRunning = false;
+let lastClaimedId = null;
+
+socket.onSensing(async ({ parcels, agents }) => {
     visibleParcels = parcels ?? [];
     updateFromSensing({ parcels, agents });
+
+    if (missionRunning || loopRunning || !beliefs.me) return;
+    loopRunning = true;
+    try {
+        reviseIntention();
+        const intent = getCurrentIntention();
+        if (intent?.type === INTENTION.PICKUP && intent.target?.id !== lastClaimedId) {
+            lastClaimedId = intent.target.id;
+            socket.emitShout(JSON.stringify({ cmd: 'CLAIM', parcelId: intent.target.id }));
+        }
+        if (intent) await executePlan(socket, intent);
+    } catch (err) {
+        console.error('[LOOP ERROR]', err.message);
+    } finally {
+        loopRunning = false;
+    }
 });
 
 // ─── Tools ────────────────────────────────────────────────────────────────────
@@ -243,6 +260,8 @@ Rules:
 - After send_mission_to_bdi completes, give Final Answer immediately.
 `.trim();
 
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
 // ─── ReAct loop ───────────────────────────────────────────────────────────────
 
 function extractAction(text) {
@@ -256,9 +275,23 @@ function extractFinalAnswer(text) {
     return m ? m[1].trim() : null;
 }
 
-async function callLLM(messages) {
-    const res = await llm.chat.completions.create({ model: MODEL, messages, temperature: 0 });
-    return res.choices?.[0]?.message?.content ?? '';
+async function callLLM(messages, retries = 3) {
+    for (let attempt = 1; attempt <= retries; attempt++) {
+        try {
+            const res = await llm.chat.completions.create({ model: MODEL, messages, temperature: 0 });
+            return res.choices?.[0]?.message?.content ?? '';
+        } catch (err) {
+            const isTimeout = err.constructor.name === 'APIConnectionTimeoutError'
+                || err.constructor.name === 'APITimeoutError'
+                || err.code === 'ETIMEDOUT';
+            if (isTimeout && attempt < retries) {
+                console.warn(`[LLM] Timeout on attempt ${attempt}/${retries}, retrying in ${attempt}s...`);
+                await sleep(attempt * 1000);
+                continue;
+            }
+            throw err;
+        }
+    }
 }
 
 async function runMissionTurn(userInput, maxIterations = 100) {
@@ -311,9 +344,15 @@ async function runMissionTurn(userInput, maxIterations = 100) {
 let missionRunning = false;
 
 socket.onMsg(async (id, name, msg) => {
-    // Ignore our own messages and BDI command messages
     if (id === me.id) return;
-    try { const p = JSON.parse(msg); if (p.cmd) return; } catch {}
+    try {
+        const p = JSON.parse(msg);
+        if (p.cmd === 'CLAIM' && name === process.env.BDI_AGENT_NAME) {
+            beliefs.claimedByOther.set(id, p.parcelId);
+            return;
+        }
+        if (p.cmd) return; // other BDI commands
+    } catch {}
 
     console.log(`\n[CHAT] ${name}: ${msg}`);
 
@@ -332,27 +371,5 @@ socket.onMsg(async (id, name, msg) => {
     }
 });
 
-// ─── Autonomous delivery loop (BDI logic) ────────────────────────────────────
-
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
-async function deliveryLoop() {
-    await sleep(2000); // wait for map and position to load
-    while (true) {
-        if (missionRunning || !beliefs.me || mapTiles.length === 0) {
-            await sleep(200);
-            continue;
-        }
-        try {
-            reviseIntention();
-            const intent = getCurrentIntention();
-            if (intent) await executePlan(socket, intent);
-            else await sleep(200);
-        } catch (err) {
-            console.error('[LOOP ERROR]', err.message);
-            await sleep(500);
-        }
-    }
-}
 
 console.log('[LLM AGENT] Started. Listening for special missions via chat.');

@@ -5,6 +5,7 @@ export const beliefs = {
     carriedParcels: new Map(), // id -> { id, reward, ... } — parcels we hold, live reward from sensing
     agents: new Map(),      // id -> { id, name, x, y, score }
     carrying: [],           // parcel ids this agent is currently holding
+    claimedByOther: new Map(), // agentId -> parcelId claimed by teammate
 };
 let sensingTick = 0;
 export function updateFromSensing({ parcels, agents }) {
@@ -42,6 +43,11 @@ export function updateFromSensing({ parcels, agents }) {
     }
     for (const a of agents ?? []) {
         beliefs.agents.set(a.id, a);
+    }
+
+    // Remove claims for parcels that are no longer visible
+    for (const [agentId, parcelId] of beliefs.claimedByOther) {
+        if (!beliefs.parcels.has(parcelId)) beliefs.claimedByOther.delete(agentId);
     }
 }
 
@@ -83,5 +89,6 @@ export function deliveryTiles() {
 }
 
 export function freeParcels() {
-    return [...beliefs.parcels.values()].filter((p) => !p.carriedBy);
+    const claimed = new Set(beliefs.claimedByOther.values());
+    return [...beliefs.parcels.values()].filter(p => !p.carriedBy && !claimed.has(p.id));
 }

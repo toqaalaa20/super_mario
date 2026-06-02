@@ -21,11 +21,16 @@ socket.on('map', (width, height, tiles) => {
 // ─── Listen for mission commands from the LLM agent via game chat ─────────────
 
 socket.onMsg((id, name, msg) => {
-    // Only process messages from our LLM agent
-    if (name !== process.env.LLM_AGENT_NAME) return;
-
+    if (id === beliefs.me?.id) return;
     try {
         const parsed = JSON.parse(msg);
+
+        if (parsed.cmd === 'CLAIM' && name === process.env.LLM_AGENT_NAME) {
+            beliefs.claimedByOther.set(id, parsed.parcelId);
+            return;
+        }
+
+        if (name !== process.env.LLM_AGENT_NAME) return;
 
         if (parsed.cmd === 'MISSION') {
             setMissionState({
@@ -49,6 +54,7 @@ socket.onMsg((id, name, msg) => {
 // ─── Main sensing loop ────────────────────────────────────────────────────────
 
 let running = false;
+let lastClaimedId = null;
 
 socket.onSensing(async (sensing) => {
     updateFromSensing(sensing);
@@ -59,6 +65,10 @@ socket.onSensing(async (sensing) => {
     try {
         reviseIntention();
         const intent = getCurrentIntention();
+        if (intent?.type === 'pickup' && intent.target?.id !== lastClaimedId) {
+            lastClaimedId = intent.target.id;
+            socket.emitShout(JSON.stringify({ cmd: 'CLAIM', parcelId: intent.target.id }));
+        }
         if (intent) await executePlan(socket, intent);
     } catch (err) {
         console.error('[BDI ERROR]', err.message);
