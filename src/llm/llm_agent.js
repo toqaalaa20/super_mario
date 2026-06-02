@@ -1,6 +1,9 @@
 import 'dotenv/config';
 import OpenAI from 'openai';
 import { DjsConnect } from '@unitn-asa/deliveroo-js-sdk';
+import { beliefs, updateFromSensing, setMap } from '../bdi/beliefs.js';
+import { reviseIntention, getCurrentIntention } from '../bdi/intentions.js';
+import { executePlan } from '../bdi/executor.js';
 
 // ─── LLM client ───────────────────────────────────────────────────────────────
 
@@ -21,7 +24,10 @@ const socket = new DjsConnect(
     process.env.LLM_TOKEN,
 );
 
-socket.onConnect(() => console.log('[LLM] Connected to Deliveroo'));
+socket.onConnect(() => {
+    console.log('[LLM] Connected to Deliveroo');
+    deliveryLoop();
+});
 
 // ─── Local state ──────────────────────────────────────────────────────────────
 
@@ -31,14 +37,17 @@ let visibleParcels = [];
 
 socket.onYou(({ id, name, x, y, score }) => {
     Object.assign(me, { id, name, x, y, score });
+    beliefs.me = me; // share reference so BDI modules always see current position
 });
 
 socket.on('map', (width, height, tiles) => {
     mapTiles = tiles;
+    setMap(tiles);
 });
 
 socket.onSensing(({ parcels, agents }) => {
     visibleParcels = parcels ?? [];
+    updateFromSensing({ parcels, agents });
 });
 
 // ─── Tools ────────────────────────────────────────────────────────────────────
@@ -322,5 +331,28 @@ socket.onMsg(async (id, name, msg) => {
         missionRunning = false;
     }
 });
+
+// ─── Autonomous delivery loop (BDI logic) ────────────────────────────────────
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+async function deliveryLoop() {
+    await sleep(2000); // wait for map and position to load
+    while (true) {
+        if (missionRunning || !beliefs.me || mapTiles.length === 0) {
+            await sleep(200);
+            continue;
+        }
+        try {
+            reviseIntention();
+            const intent = getCurrentIntention();
+            if (intent) await executePlan(socket, intent);
+            else await sleep(200);
+        } catch (err) {
+            console.error('[LOOP ERROR]', err.message);
+            await sleep(500);
+        }
+    }
+}
 
 console.log('[LLM AGENT] Started. Listening for special missions via chat.');
