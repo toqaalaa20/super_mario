@@ -6,6 +6,8 @@ export const INTENTION = {
     PICKUP: 'pickup',
     DELIVER: 'deliver',
     EXPLORE: 'explore',
+    MEETUP: 'meetup',
+    WAIT: 'wait',
 };
 
 let current = null;
@@ -66,6 +68,53 @@ function shouldDeliver(me, nearestDelivery) {
 export function reviseIntention() {
     const me = beliefs.me;
     if (!me) return;
+
+    // ── 0. Level 3 mission overrides ─────────────────────────────────────────
+    if (missionState.active) {
+        if (missionState.type === 'COORDINATE_MEETUP') {
+            const { x, y, radius = 3 } = missionState.params;
+            if (manhattan(me, { x, y }) <= radius) {
+                current = { type: INTENTION.WAIT, target: { x, y } };
+            } else {
+                const changed = !current || current.type !== INTENTION.MEETUP
+                    || current.target?.x !== x || current.target?.y !== y;
+                if (changed) current = { type: INTENTION.MEETUP, target: { x, y, radius } };
+            }
+            return;
+        }
+
+        if (missionState.type === 'PICKUP_AND_DELIVER') {
+            const { parcelId, x, y } = missionState.params;
+            if (beliefs.carrying.includes(parcelId)) {
+                // Holding the handoff parcel — clear mission, fall through to normal DELIVER
+                setMissionState({ active: false, type: null, params: {}, description: '' });
+            } else {
+                // Not yet carrying — navigate to drop point and pick it up
+                const parcel = beliefs.parcels.get(parcelId) ?? { id: parcelId, x, y };
+                const changed = !current || current.type !== INTENTION.PICKUP
+                    || current.target?.id !== parcelId;
+                if (changed) current = { type: INTENTION.PICKUP, target: parcel };
+                return;
+            }
+        }
+
+        if (missionState.type === 'WAIT_FOR_SIGNAL') {
+            const frozen = missionState.params.frozen !== false;
+            if (frozen) {
+                if (me.y % 2 !== 0) {
+                    current = { type: INTENTION.WAIT, target: null };
+                    return;
+                }
+                const ty = me.y + 1;
+                const changed = !current || current.type !== INTENTION.MEETUP
+                    || current.target?.x !== me.x || current.target?.y !== ty;
+                if (changed) current = { type: INTENTION.MEETUP, target: { x: me.x, y: ty, radius: 0 } };
+                return;
+            }
+            // frozen === false: green light received — clear mission and fall through
+            setMissionState({ active: false, type: null, params: {}, description: '' });
+        }
+    }
 
     let nextIntention = null;
 

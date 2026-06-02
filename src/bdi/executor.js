@@ -63,6 +63,8 @@ export async function executePlan(socket, intention) {
             cachedPath = aStar(me, intention.target);
         } else if (intention.type === INTENTION.EXPLORE) {
             cachedPath = explorePath(me);
+        } else if (intention.type === INTENTION.MEETUP) {
+            cachedPath = aStar(me, intention.target);
         } else {
             cachedPath = [];
         }
@@ -125,6 +127,30 @@ export async function executePlan(socket, intention) {
         lastExploreStep = { from, to };
         rememberMove(nextPosition(me, dir));
         markVisited(nextPosition(me, dir).x, nextPosition(me, dir).y);
+        return true;
+    }
+
+    // --- WAIT: freeze in place ---
+    if (intention.type === INTENTION.WAIT) {
+        return true;
+    }
+
+    // --- MEETUP: navigate toward target, stop when within radius ---
+    if (intention.type === INTENTION.MEETUP) {
+        const radius = intention.target.radius ?? 1;
+        const dist = Math.abs(me.x - intention.target.x) + Math.abs(me.y - intention.target.y);
+        if (dist <= radius) return true;
+
+        if (cachedPath.length === 0) return false;
+        const dir = cachedPath.shift();
+        const next = nextPosition(me, dir);
+        const ok = await socket.emitMove(dir);
+        if (!ok) {
+            cachedPath = [];
+            cachedIntentionKey = null;
+            return false;
+        }
+        rememberMove(next);
         return true;
     }
 

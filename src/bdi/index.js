@@ -3,7 +3,7 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 import { beliefs, updateFromSensing, setMap } from './beliefs.js';
-import { reviseIntention, getCurrentIntention, setMissionState } from './intentions.js';
+import { reviseIntention, getCurrentIntention, setMissionState, missionState } from './intentions.js';
 import { executePlan } from './executor.js';
 
 const socket = new DjsConnect(
@@ -70,6 +70,12 @@ socket.onMsg((id, name, msg) => {
     } catch {
         // Not a command message — ignore
     }
+
+    // Green-light signal for WAIT_FOR_SIGNAL mission (plain-text game message)
+    if (missionState.type === 'WAIT_FOR_SIGNAL' && msg.toLowerCase().includes('green')) {
+        setMissionState({ ...missionState, params: { ...missionState.params, frozen: false } });
+        console.log('[BDI] Green light received — unfreezing');
+    }
 });
 
 // ─── Main sensing loop ────────────────────────────────────────────────────────
@@ -109,5 +115,8 @@ socket.onYou(({ id, name, x, y, score }) => {
         beliefs.me = { id, name, x, y, score };
     } else {
         Object.assign(beliefs.me, { x, y, score });
+    }
+    if (llmAgentId) {
+        socket.emitSay(llmAgentId, JSON.stringify({ cmd: 'STATUS', x, y }));
     }
 });

@@ -48,6 +48,8 @@ socket.on('map', (width, height, tiles) => {
 
 let loopRunning = false;
 let lastClaimedId = null;
+let lastBdiPosition = null;
+const pendingSignalResolvers = [];
 
 socket.onSensing(async ({ parcels, agents }) => {
     visibleParcels = parcels ?? [];
@@ -189,6 +191,27 @@ async function sendMissionToBDI(args) {
     }
 }
 
+async function getBdiPosition() {
+    if (!lastBdiPosition) return 'Error: BDI position not yet received.';
+    return JSON.stringify(lastBdiPosition);
+}
+
+async function waitForChatSignal(keyword) {
+    const kw = keyword.trim().toLowerCase();
+    return new Promise((resolve) => {
+        const timer = setTimeout(() => {
+            const idx = pendingSignalResolvers.findIndex(r => r.keyword === kw);
+            if (idx !== -1) pendingSignalResolvers.splice(idx, 1);
+            resolve(`Timeout: no "${keyword}" signal received within 2 minutes.`);
+        }, 120_000);
+        pendingSignalResolvers.push({
+            keyword: kw,
+            resolve: (msg) => { clearTimeout(timer); resolve(`Signal received: "${msg}"`); },
+        });
+        console.log(`[LLM] Waiting for chat signal: "${keyword}"`);
+    });
+}
+
 async function clearMissionOnBDI() {
     const cmd = JSON.stringify({ cmd: 'MISSION_CLEAR' });
     if (bdiAgentId) await socket.emitSay(bdiAgentId, cmd);
@@ -211,6 +234,8 @@ const TOOLS = {
     send_chat_message: sendChatMessage,
     send_mission_to_bdi: sendMissionToBDI,
     clear_mission_on_bdi: clearMissionOnBDI,
+    get_bdi_position: getBdiPosition,
+    wait_for_chat_signal: waitForChatSignal,
 };
 
 // ─── System prompt ─────────────────────────────────────────────────────────────
@@ -232,14 +257,20 @@ Available tools:
 - get_map_info(): map overview
 - get_all_walkable_tiles(): list all walkable tiles with x, y, and whether they are delivery tiles. Use this to find tiles by spatial description (e.g. leftmost = min x, rightmost = max x, topmost = max y, bottommost = min y)
 - send_chat_message(text): send a plain text message to the game chat
-- send_mission_to_bdi(json): send a Level 2 mission command to the BDI agent.
-  The JSON must be: { "type": "STACK_SIZE"|"PREFERRED_DELIVERY"|"AVOID_TILE"|"SCORE_FILTER", "params": {...}, "description": "..." }
-  Examples:
+- send_mission_to_bdi(json): send a Level 2 or Level 3 mission command to the BDI agent.
+  The JSON must be: { "type": "<TYPE>", "params": {...}, "description": "..." }
+  Level 2 types — "STACK_SIZE"|"PREFERRED_DELIVERY"|"AVOID_TILE"|"SCORE_FILTER":
     { "type": "STACK_SIZE", "params": { "size": 3 }, "description": "Deliver exactly 3 parcels at a time" }
     { "type": "PREFERRED_DELIVERY", "params": { "tiles": [{"x":4,"y":7}] }, "description": "Prefer delivery at (4,7)" }
     { "type": "AVOID_TILE", "params": { "x": 5, "y": 3 }, "description": "Avoid tile (5,3)" }
     { "type": "SCORE_FILTER", "params": { "maxReward": 10 }, "description": "Only deliver parcels reward <= 10" }
+  Level 3 types — "COORDINATE_MEETUP"|"WAIT_FOR_SIGNAL"|"PICKUP_AND_DELIVER":
+    { "type": "COORDINATE_MEETUP", "params": { "x": N, "y": M, "radius": 3 }, "description": "Both agents move to within 3 tiles of (N,M) and wait for each other" }
+    { "type": "WAIT_FOR_SIGNAL", "params": { "row_parity": "odd" }, "description": "BDI moves to odd row and freezes until green-light chat message" }
+    { "type": "PICKUP_AND_DELIVER", "params": { "parcelId": "<id>", "x": N, "y": M }, "description": "BDI picks up parcel <id> from (N,M) and delivers it" }
 - clear_mission_on_bdi(): cancel any active mission on the BDI agent
+- get_bdi_position(): get BDI agent's last known (x,y) position — use to check if BDI arrived at meetup point
+- wait_for_chat_signal(keyword): block until that keyword appears in game chat (e.g. "green"); times out after 2 minutes
 
 Movement rules:
 - move(up) increases y by 1, move(down) decreases y by 1
@@ -252,6 +283,10 @@ Mission decision rules:
   * If the mission gives positive points or a reward multiplier, accept it.
 - For Level 1 atomic missions (move, calculate, answer a question, drop a parcel): execute them directly with tools above.
 - For Level 2 persistent missions (e.g. "deliver stacks of 3 to double reward"): call send_mission_to_bdi() to instruct the BDI agent, then give Final Answer immediately.
+- For Level 3 coordination missions:
+  * COORDINATE_MEETUP: (1) call send_mission_to_bdi with type COORDINATE_MEETUP so the BDI starts moving there; (2) call move_to to navigate yourself to the same (x,y); (3) poll get_bdi_position() and get_my_position(), calculate manhattan distance (|ax-x|+|ay-y|) for each agent, and confirm BOTH are within radius 3 of the target; (4) only then give Final Answer.
+  * WAIT_FOR_SIGNAL (red-light/green-light): BOTH agents must be on an odd-numbered row (y % 2 !== 0) and frozen before the green light. Steps: (1) call send_mission_to_bdi with type WAIT_FOR_SIGNAL so BDI starts moving to an odd row; (2) call get_my_position() to check your own y — if y is even, call move_to(x=<your_x>, y=<your_y+1>) to step onto the next odd row; (3) call wait_for_chat_signal("green") to freeze yourself until the signal arrives; (4) give Final Answer after the signal is received.
+  * PARCEL_HANDOFF (you pick up, BDI delivers): (1) call pickup() on the target parcel; (2) call move_to to navigate to a convenient intermediate position; (3) call putdown() to drop the parcel; (4) call get_my_position() to get the exact drop coordinates; (5) call send_mission_to_bdi({ type: "PICKUP_AND_DELIVER", params: { parcelId: "<id>", x: <drop_x>, y: <drop_y> } }) — BDI will navigate to the drop point, pick up the parcel, and deliver it autonomously; (6) give Final Answer immediately.
 - After completing a mission, call send_chat_message to report the result.
 
 STRICT OUTPUT FORMAT — use exactly one format per message:
@@ -375,8 +410,20 @@ socket.onMsg(async (id, name, msg) => {
             console.log('[LLM] Received CLAIM from BDI:', p.parcelId);
             return;
         }
+        if (p.cmd === 'STATUS' && name === process.env.BDI_AGENT_NAME) {
+            lastBdiPosition = { x: p.x, y: p.y };
+            return;
+        }
         if (p.cmd) return; // other inter-agent commands
     } catch {}
+
+    // Resolve any pending wait_for_chat_signal calls
+    for (let i = pendingSignalResolvers.length - 1; i >= 0; i--) {
+        if (msg.toLowerCase().includes(pendingSignalResolvers[i].keyword)) {
+            pendingSignalResolvers[i].resolve(msg);
+            pendingSignalResolvers.splice(i, 1);
+        }
+    }
 
     console.log(`\n[CHAT] ${name}: ${msg}`);
 
