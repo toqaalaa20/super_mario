@@ -2,7 +2,7 @@ import 'dotenv/config';
 import OpenAI from 'openai';
 import { DjsConnect } from '@unitn-asa/deliveroo-js-sdk';
 import { beliefs, updateFromSensing, setMap } from '../bdi/beliefs.js';
-import { reviseIntention, getCurrentIntention, INTENTION } from '../bdi/intentions.js';
+import { reviseIntention, getCurrentIntention, INTENTION, setMissionState } from '../bdi/intentions.js';
 import { executePlan } from '../bdi/executor.js';
 
 // ─── LLM client ───────────────────────────────────────────────────────────────
@@ -50,6 +50,7 @@ let loopRunning = false;
 let lastClaimedId = null;
 let lastBdiPosition = null;
 const pendingSignalResolvers = [];
+let pendingAutoGreenMs = null; // set when mission text contains a duration
 
 socket.onSensing(async ({ parcels, agents }) => {
     visibleParcels = parcels ?? [];
@@ -184,6 +185,13 @@ async function sendMissionToBDI(args) {
         });
         if (bdiAgentId) await socket.emitSay(bdiAgentId, cmd);
         else await socket.emitShout(cmd); // fallback if BDI not yet seen
+        // Apply the same mission state locally so this agent's sensing loop also respects it
+        setMissionState({
+            active: true,
+            type: parsed.type,
+            params: parsed.params ?? {},
+            description: parsed.description ?? '',
+        });
         console.log('[LLM] Mission command sent to BDI:', cmd);
         return `Mission sent to BDI agent: ${parsed.description}`;
     } catch (e) {
@@ -204,11 +212,26 @@ async function waitForChatSignal(keyword) {
             if (idx !== -1) pendingSignalResolvers.splice(idx, 1);
             resolve(`Timeout: no "${keyword}" signal received within 2 minutes.`);
         }, 120_000);
-        pendingSignalResolvers.push({
+        const entry = {
             keyword: kw,
             resolve: (msg) => { clearTimeout(timer); resolve(`Signal received: "${msg}"`); },
-        });
+        };
+        pendingSignalResolvers.push(entry);
         console.log(`[LLM] Waiting for chat signal: "${keyword}"`);
+
+        // Start the auto-green timer now that the resolver is registered
+        if (kw === 'green' && pendingAutoGreenMs !== null) {
+            const ms = pendingAutoGreenMs;
+            pendingAutoGreenMs = null;
+            setTimeout(() => {
+                const idx = pendingSignalResolvers.indexOf(entry);
+                if (idx !== -1) {
+                    entry.resolve(`auto-green after ${ms / 1000}s`);
+                    pendingSignalResolvers.splice(idx, 1);
+                }
+            }, ms);
+            console.log(`[LLM] Auto-green timer started: ${ms}ms`);
+        }
     });
 }
 
@@ -216,6 +239,7 @@ async function clearMissionOnBDI() {
     const cmd = JSON.stringify({ cmd: 'MISSION_CLEAR' });
     if (bdiAgentId) await socket.emitSay(bdiAgentId, cmd);
     else await socket.emitShout(cmd);
+    setMissionState({ active: false, type: null, params: {}, description: '' });
     console.log('[LLM] Mission clear sent to BDI');
     return 'Mission cleared on BDI agent.';
 }
@@ -281,7 +305,8 @@ Mission decision rules:
 - Before accepting a mission, evaluate whether it is profitable.
   * If the mission gives NEGATIVE points or is clearly a trap, reply "Mission declined: not profitable." and stop.
   * If the mission gives positive points or a reward multiplier, accept it.
-- For Level 1 atomic missions (move, calculate, answer a question, drop a parcel): execute them directly with tools above.
+- For Level 1 atomic missions (move, calculate, answer a question, drop a parcel, timed stop): execute them directly with tools above.
+  * "Stop for N seconds": call wait_for_chat_signal("green") — the green signal fires automatically after N seconds.
 - For Level 2 persistent missions (e.g. "deliver stacks of 3 to double reward"): call send_mission_to_bdi() to instruct the BDI agent, then give Final Answer immediately.
 - For Level 3 coordination missions:
   * COORDINATE_MEETUP: (1) call send_mission_to_bdi with type COORDINATE_MEETUP so the BDI starts moving there; (2) call move_to to navigate yourself to the same (x,y); (3) poll get_bdi_position() and get_my_position(), calculate manhattan distance (|ax-x|+|ay-y|) for each agent, and confirm BOTH are within radius 3 of the target; (4) only then give Final Answer.
@@ -432,9 +457,19 @@ socket.onMsg(async (id, name, msg) => {
         return;
     }
 
+    // If the mission specifies a wait duration, store it so waitForChatSignal can
+    // start the timer at the moment the resolver is actually registered (not now,
+    // since the LLM may take several API round-trips before calling the tool).
+    const timeMatch = msg.match(/(\d+(?:\.\d+)?)\s*second/i);
+    if (timeMatch) {
+        pendingAutoGreenMs = parseFloat(timeMatch[1]) * 1000;
+        console.log(`[LLM] Auto-green will fire ${timeMatch[1]}s after wait begins`);
+    }
+
     missionRunning = true;
     try {
-        await runMissionTurn(`Special mission from ${name}: ${msg}`);
+        const result = await runMissionTurn(`Special mission from ${name}: ${msg}`);
+        if (result) await socket.emitShout(result);
     } catch (err) {
         console.error('[LLM ERROR]', err);
     } finally {
