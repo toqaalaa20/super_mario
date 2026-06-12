@@ -2,8 +2,9 @@ import 'dotenv/config';
 import OpenAI from 'openai';
 import { DjsConnect } from '@unitn-asa/deliveroo-js-sdk';
 import { beliefs, updateFromSensing, setMap } from '../bdi/beliefs.js';
-import { reviseIntention, getCurrentIntention, INTENTION, setMissionState } from '../bdi/intentions.js';
+import { reviseIntention, getCurrentIntention, INTENTION, setMissionState, missionState } from '../bdi/intentions.js';
 import { executePlan } from '../bdi/executor.js';
+import { aStar } from '../bdi/astar.js';
 
 // ─── LLM client ───────────────────────────────────────────────────────────────
 
@@ -36,10 +37,26 @@ const me = { id: null, name: null, x: null, y: null, score: 0 };
 let mapTiles = [];
 let visibleParcels = [];
 
+let positionUpdateResolvers = [];
+
 socket.onYou(({ id, name, x, y, score }) => {
     Object.assign(me, { id, name, x, y, score });
     beliefs.me = me; // share reference so BDI modules always see current position
+
+    const resolvers = positionUpdateResolvers;
+    positionUpdateResolvers = [];
+    resolvers.forEach(resolve => resolve());
 });
+
+// Wait for the next server-confirmed position update (or timeout) — keeps
+// move_to's loop paced on confirmed state instead of racing ahead on the
+// executor's optimistic local position update.
+function waitForPositionUpdate(timeoutMs = 1000) {
+    return new Promise((resolve) => {
+        const timer = setTimeout(resolve, timeoutMs);
+        positionUpdateResolvers.push(() => { clearTimeout(timer); resolve(); });
+    });
+}
 
 socket.on('map', (width, height, tiles) => {
     mapTiles = tiles;
@@ -107,21 +124,31 @@ async function moveTo(args) {
         || args.match(/(-?\d+)[,\s]+(-?\d+)/);
     if (!match) return `Error: could not parse target coordinates from '${args}'.`;
     const tx = parseInt(match[1]), ty = parseInt(match[2]);
-    let steps = 0, maxSteps = 200;
-    while ((Math.round(me.x) !== tx || Math.round(me.y) !== ty) && steps < maxSteps) {
-        const dx = tx - Math.round(me.x);
-        const dy = ty - Math.round(me.y);
-        const dir = Math.abs(dx) >= Math.abs(dy)
-            ? (dx > 0 ? 'right' : 'left')
-            : (dy > 0 ? 'up' : 'down');
-        const result = await socket.emitMove(dir);
-        if (!result) break;
-        me.x = result.x; me.y = result.y;
-        steps++;
+
+    // Use BDI A* pathfinding — smarter than greedy step-by-step navigation
+    setMissionState({
+        active: true,
+        type: 'MOVE_TO_POSITION',
+        params: { x: tx, y: ty, reward: 0 },
+        description: `Move to (${tx},${ty})`,
+    });
+
+    while (true) {
+        if (!missionState.active) break;
+        reviseIntention();
+        if (!missionState.active) break; // mission completed during this revision — don't execute a leftover intention
+        const intent = getCurrentIntention();
+        if (!intent) break;
+        const moved = await executePlan(socket, intent);
+        if (moved) await waitForPositionUpdate(); // pace on server-confirmed position, like the BDI's onSensing loop
+        else await sleep(100); // yield to event loop so socket I/O can process
     }
-    if (Math.round(me.x) === tx && Math.round(me.y) === ty)
-        return `Reached (${tx}, ${ty}) in ${steps} steps.`;
-    return `Stopped at (${Math.round(me.x)}, ${Math.round(me.y)}) after ${steps} steps. Target was (${tx}, ${ty}).`;
+
+    setMissionState({ active: false, type: null, params: {}, description: '' });
+    const mx = Math.round(beliefs.me?.x ?? me.x);
+    const my = Math.round(beliefs.me?.y ?? me.y);
+    if (mx === tx && my === ty) return `Reached (${tx}, ${ty}).`;
+    return `Stopped at (${mx}, ${my}). Target was (${tx}, ${ty}).`;
 }
 
 async function pickup() {
@@ -206,6 +233,15 @@ async function getBdiPosition() {
 
 async function waitForChatSignal(keyword) {
     const kw = keyword.trim().toLowerCase();
+
+    // Signal may have arrived before this call — check the queue first
+    const queueIdx = missionQueue.findIndex(m => m.msg.toLowerCase().includes(kw));
+    if (queueIdx !== -1) {
+        const { msg } = missionQueue.splice(queueIdx, 1)[0];
+        console.log(`[LLM] Signal "${keyword}" found in mission queue — resolving immediately`);
+        return `Signal received: "${msg}"`;
+    }
+
     return new Promise((resolve) => {
         const timer = setTimeout(() => {
             const idx = pendingSignalResolvers.findIndex(r => r.keyword === kw);
@@ -281,8 +317,10 @@ Available tools:
 - get_map_info(): map overview
 - get_all_walkable_tiles(): list all walkable tiles with x, y, and whether they are delivery tiles. Use this to find tiles by spatial description (e.g. leftmost = min x, rightmost = max x, topmost = max y, bottommost = min y)
 - send_chat_message(text): send a plain text message to the game chat
-- send_mission_to_bdi(json): send a Level 2 or Level 3 mission command to the BDI agent.
+- send_mission_to_bdi(json): send a mission command to the BDI agent.
   The JSON must be: { "type": "<TYPE>", "params": {...}, "description": "..." }
+  Navigation type — "MOVE_TO_POSITION" (send this to BDI when you want the BDI agent to navigate somewhere):
+    { "type": "MOVE_TO_POSITION", "params": { "x": 4, "y": 7, "reward": 10 }, "description": "BDI moves to (4,7) for +10pts using A* pathfinding" }
   Level 2 types — "STACK_SIZE"|"PREFERRED_DELIVERY"|"AVOID_TILE"|"SCORE_FILTER":
     { "type": "STACK_SIZE", "params": { "size": 3 }, "description": "Deliver exactly 3 parcels at a time" }
     { "type": "PREFERRED_DELIVERY", "params": { "tiles": [{"x":4,"y":7}] }, "description": "Prefer delivery at (4,7)" }
@@ -290,7 +328,7 @@ Available tools:
     { "type": "SCORE_FILTER", "params": { "maxReward": 10 }, "description": "Only deliver parcels reward <= 10" }
   Level 3 types — "COORDINATE_MEETUP"|"WAIT_FOR_SIGNAL"|"PICKUP_AND_DELIVER":
     { "type": "COORDINATE_MEETUP", "params": { "x": N, "y": M, "radius": 3 }, "description": "Both agents move to within 3 tiles of (N,M) and wait for each other" }
-    { "type": "WAIT_FOR_SIGNAL", "params": { "row_parity": "odd" }, "description": "BDI moves to odd row and freezes until green-light chat message" }
+    { "type": "WAIT_FOR_SIGNAL", "params": {}, "description": "BDI moves to an odd row and freezes until green-light chat message" }
     { "type": "PICKUP_AND_DELIVER", "params": { "parcelId": "<id>", "x": N, "y": M }, "description": "BDI picks up parcel <id> from (N,M) and delivers it" }
 - clear_mission_on_bdi(): cancel any active mission on the BDI agent
 - get_bdi_position(): get BDI agent's last known (x,y) position — use to check if BDI arrived at meetup point
@@ -306,13 +344,14 @@ Mission decision rules:
   * If the mission gives NEGATIVE points or is clearly a trap, reply "Mission declined: not profitable." and stop.
   * If the mission gives positive points or a reward multiplier, accept it.
 - For Level 1 atomic missions (move, calculate, answer a question, drop a parcel, timed stop): execute them directly with tools above.
+  * After calculate returns a result, your very next output MUST be Final Answer: <result>. Do not add more reasoning or tool calls.
   * "Stop for N seconds": call wait_for_chat_signal("green") — the green signal fires automatically after N seconds.
 - For Level 2 persistent missions (e.g. "deliver stacks of 3 to double reward"): call send_mission_to_bdi() to instruct the BDI agent, then give Final Answer immediately.
 - For Level 3 coordination missions:
   * COORDINATE_MEETUP: (1) call send_mission_to_bdi with type COORDINATE_MEETUP so the BDI starts moving there; (2) call move_to to navigate yourself to the same (x,y); (3) poll get_bdi_position() and get_my_position(), calculate manhattan distance (|ax-x|+|ay-y|) for each agent, and confirm BOTH are within radius 3 of the target; (4) only then give Final Answer.
   * WAIT_FOR_SIGNAL (red-light/green-light): BOTH agents must be on an odd-numbered row (y % 2 !== 0) and frozen before the green light. Steps: (1) call send_mission_to_bdi with type WAIT_FOR_SIGNAL so BDI starts moving to an odd row; (2) call get_my_position() to check your own y — if y is even, call move_to(x=<your_x>, y=<your_y+1>) to step onto the next odd row; (3) call wait_for_chat_signal("green") to freeze yourself until the signal arrives; (4) give Final Answer after the signal is received.
   * PARCEL_HANDOFF (you pick up, BDI delivers): (1) call pickup() on the target parcel; (2) call move_to to navigate to a convenient intermediate position; (3) call putdown() to drop the parcel; (4) call get_my_position() to get the exact drop coordinates; (5) call send_mission_to_bdi({ type: "PICKUP_AND_DELIVER", params: { parcelId: "<id>", x: <drop_x>, y: <drop_y> } }) — BDI will navigate to the drop point, pick up the parcel, and deliver it autonomously; (6) give Final Answer immediately.
-- After completing a mission, call send_chat_message to report the result.
+- After completing a mission, your Final Answer text is automatically broadcast to the game chat — do NOT call send_chat_message to report the result (that would double-send). Use send_chat_message only for mid-mission status messages.
 
 STRICT OUTPUT FORMAT — use exactly one format per message:
 
@@ -328,8 +367,8 @@ Final Answer: <summary of what was done>
 Rules:
 - One action per message. Never mix Action and Final Answer.
 - Do not invent tool results. Wait for the Observation.
-- Use move_to for multi-step navigation.
-- After send_mission_to_bdi completes, give Final Answer immediately.
+- Use move_to for multi-step navigation. NEVER use move() to reach a coordinate target — move() is only for single-step adjustments when already near the target.
+- After send_mission_to_bdi completes for a Level 2 mission, give Final Answer immediately. For Level 3 missions, continue with the remaining steps listed above before giving Final Answer.
 `.trim();
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
@@ -385,6 +424,12 @@ async function runMissionTurn(userInput, maxIterations = 100) {
             if (TOOLS[action]) {
                 console.log(`[LLM] executing tool: ${action}("${actionInput}")`);
                 observation = await TOOLS[action](actionInput);
+                // Level 2 missions run forever on the BDI — stop LLM iterations immediately
+                const LEVEL2_TYPES = ['AVOID_TILE', 'STACK_SIZE', 'PREFERRED_DELIVERY', 'SCORE_FILTER'];
+                if (action === 'send_mission_to_bdi' && missionState.active && LEVEL2_TYPES.includes(missionState.type)) {
+                    console.log(`[LLM] Level 2 mission "${missionState.type}" active — stopping iterations.`);
+                    return observation;
+                }
             } else {
                 observation = `Error: unknown tool '${action}'. Available: ${Object.keys(TOOLS).join(', ')}`;
             }
@@ -415,8 +460,30 @@ async function runMissionTurn(userInput, maxIterations = 100) {
 
 let missionRunning = false;
 let bdiAgentId = null; // learned from first message received from BDI
+const missionQueue = [];
+
+async function processNextMission() {
+    if (missionRunning || missionQueue.length === 0) return;
+    const { name, msg } = missionQueue.shift();
+    const timeMatch = msg.match(/(\d+(?:\.\d+)?)\s*second/i);
+    if (timeMatch) {
+        pendingAutoGreenMs = parseFloat(timeMatch[1]) * 1000;
+        console.log(`[LLM] Auto-green will fire ${timeMatch[1]}s after wait begins`);
+    }
+    missionRunning = true;
+    try {
+        const result = await runMissionTurn(`Special mission from ${name}: ${msg}`);
+        if (result) await socket.emitShout(result);
+    } catch (err) {
+        console.error('[LLM ERROR]', err);
+    } finally {
+        missionRunning = false;
+        processNextMission();
+    }
+}
 
 socket.onMsg(async (id, name, msg) => {
+    msg = String(msg ?? '');
     if (id === me.id) return;
     if (name === process.env.BDI_AGENT_NAME && !bdiAgentId) {
         bdiAgentId = id;
@@ -443,38 +510,29 @@ socket.onMsg(async (id, name, msg) => {
     } catch {}
 
     // Resolve any pending wait_for_chat_signal calls
+    let resolvedSignal = false;
     for (let i = pendingSignalResolvers.length - 1; i >= 0; i--) {
         if (msg.toLowerCase().includes(pendingSignalResolvers[i].keyword)) {
             pendingSignalResolvers[i].resolve(msg);
             pendingSignalResolvers.splice(i, 1);
+            resolvedSignal = true;
         }
     }
 
     console.log(`\n[CHAT] ${name}: ${msg}`);
 
-    if (missionRunning) {
-        console.log('[LLM] Already running a mission, skipping.');
+    // Don't queue signal messages as new missions — they've done their job
+    if (resolvedSignal) return;
+
+    const adminName = process.env.ADMIN_NAME;
+    if (adminName && name !== adminName) {
+        console.log(`[LLM] Ignoring mission from non-admin "${name}".`);
         return;
     }
 
-    // If the mission specifies a wait duration, store it so waitForChatSignal can
-    // start the timer at the moment the resolver is actually registered (not now,
-    // since the LLM may take several API round-trips before calling the tool).
-    const timeMatch = msg.match(/(\d+(?:\.\d+)?)\s*second/i);
-    if (timeMatch) {
-        pendingAutoGreenMs = parseFloat(timeMatch[1]) * 1000;
-        console.log(`[LLM] Auto-green will fire ${timeMatch[1]}s after wait begins`);
-    }
-
-    missionRunning = true;
-    try {
-        const result = await runMissionTurn(`Special mission from ${name}: ${msg}`);
-        if (result) await socket.emitShout(result);
-    } catch (err) {
-        console.error('[LLM ERROR]', err);
-    } finally {
-        missionRunning = false;
-    }
+    missionQueue.push({ name, msg });
+    console.log(`[LLM] Mission queued (queue length: ${missionQueue.length})`);
+    processNextMission();
 });
 
 

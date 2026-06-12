@@ -17,7 +17,7 @@ export function getCurrentIntention() { return current; }
 // ─── Mission state (written by llm_agent.js) ──────────────────────────────────
 export const missionState = {
     active: false,
-    type: null,    // 'STACK_SIZE' | 'PREFERRED_DELIVERY' | 'AVOID_TILE' | 'SCORE_FILTER'
+    type: null,    // 'STACK_SIZE' | 'PREFERRED_DELIVERY' | 'AVOID_TILE' | 'SCORE_FILTER' | 'MOVE_TO_POSITION'
     params: {},
     description: '',
 };
@@ -25,6 +25,12 @@ export const missionState = {
 export function setMissionState(state) {
     Object.assign(missionState, state);
     console.log('[INTENTION] Mission state updated:', missionState);
+}
+
+// Reset module-level state — used by tests to isolate cases
+export function resetState() {
+    current = null;
+    Object.assign(missionState, { active: false, type: null, params: {}, description: '' });
 }
 
 // ─── Mission-aware helpers ─────────────────────────────────────────────────────
@@ -71,6 +77,14 @@ export function reviseIntention() {
     const me = beliefs.me;
     if (!me) return;
 
+    // Remove filtered parcels from beliefs so freeParcels() callers all see the same set
+    // and the agent explores instead of idling near disallowed parcels.
+    if (missionState.active && missionState.type === 'SCORE_FILTER') {
+        for (const [id, p] of beliefs.parcels) {
+            if (!parcelAllowed(p)) beliefs.parcels.delete(id);
+        }
+    }
+
     // ── 0. Level 3 mission overrides ─────────────────────────────────────────
     if (missionState.active) {
         if (missionState.type === 'COORDINATE_MEETUP') {
@@ -115,6 +129,19 @@ export function reviseIntention() {
             }
             // frozen === false: green light received — clear mission and fall through
             setMissionState({ active: false, type: null, params: {}, description: '' });
+        }
+
+        if (missionState.type === 'MOVE_TO_POSITION') {
+            const { x, y, reward } = missionState.params;
+            if (manhattan(me, { x, y }) === 0) {
+                console.log(`[MISSION] MOVE_TO_POSITION: reached (${x},${y}), earned +${reward}pts`);
+                setMissionState({ active: false, type: null, params: {}, description: '' });
+            } else {
+                const changed = !current || current.type !== INTENTION.MEETUP
+                    || current.target?.x !== x || current.target?.y !== y;
+                if (changed) current = { type: INTENTION.MEETUP, target: { x, y, radius: 0 } };
+                return;
+            }
         }
     }
 

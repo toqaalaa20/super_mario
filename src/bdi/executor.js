@@ -124,6 +124,7 @@ export async function executePlan(socket, intention) {
             }
             return false;
         }
+        console.log(`[EXECUTOR] ${me.name} EXPLORE moved ${dir}: ${from} -> ${to}`);
         lastExploreStep = { from, to };
         rememberMove(nextPosition(me, dir));
         markVisited(nextPosition(me, dir).x, nextPosition(me, dir).y);
@@ -150,6 +151,7 @@ export async function executePlan(socket, intention) {
             cachedIntentionKey = null;
             return false;
         }
+        console.log(`[EXECUTOR] ${me.name} MEETUP moved ${dir}: (${me.x},${me.y}) -> (${next.x},${next.y})`);
         rememberMove(next);
         return true;
     }
@@ -190,6 +192,7 @@ export async function executePlan(socket, intention) {
             }
             return false;
         }
+        console.log(`[EXECUTOR] ${me.name} ${intention.type} moved ${dir}: (${me.x},${me.y}) -> (${next.x},${next.y})`);
         rememberMove(next);
         return true;
     }
