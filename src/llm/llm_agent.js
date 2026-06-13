@@ -495,13 +495,14 @@ Movement rules:
 - Use explore when you want the agent to keep expanding into unexplored map tiles.
 
 Mission decision rules:
-- Before accepting a mission, evaluate whether it is profitable.
+- BEFORE doing anything else — before classifying the mission as Level 1/2/3, before calling move_to/explore/any tool — check whether the mission is profitable. This gate applies to EVERY mission, including ones phrased as plain navigation commands like "Go to...", "Move to...", "Head to...", "Navigate to...", "Explore...".
   * Extract any point value mentioned in the mission. Point values can be written in many formats:
     "-5pts", "-5 pts", "-5 pts.", "-5 points", "minus 5 points", "lose 5pts", "costs 5pts", etc.
   * If the point value is NEGATIVE (less than zero), ALWAYS decline regardless of formatting.
     Reply with "Mission declined: not profitable." and give Final Answer immediately. Do NOT call any tools.
   * If the point value is POSITIVE or the mission gives a reward multiplier, accept and execute it.
-  * If no point value is mentioned, use your judgment based on the mission description.
+  * If the mission mentions NO points, reward, multiplier, or other concrete benefit — even if it sounds like a normal, executable instruction (e.g. "Go to somewhere around the middle of the map.", "Move to the rightmost walkable tile.", "Explore the north area.") — it has no objective and must be declined. A mission being phrased as an actionable command does NOT make it profitable. Reply with "Mission declined: no objective or profit specified." and give Final Answer immediately. Do NOT call any tools.
+  * If the mission's instructions are logically contradictory or impossible to satisfy as written (e.g. "Pick up all parcels but also avoid moving.", "Deliver parcels without picking any up.") — even if it states a point value — do NOT attempt a partial or "most direct interpretation" of it. Reply with "Mission declined: contradictory instructions." and give Final Answer immediately. Do NOT call any tools.
 - For Level 1 atomic missions (calculate, answer a question, drop a parcel, timed stop): execute them directly with tools above.
   * After calculate returns a result, your very next output MUST be Final Answer: <result>. Do not add more reasoning or tool calls.
   * "Stop for N seconds": call wait_for_chat_signal("green") — the green signal fires automatically after N seconds.
