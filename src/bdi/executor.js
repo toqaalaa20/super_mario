@@ -1,5 +1,5 @@
 import { beliefs, freeParcels, isWalkable } from './beliefs.js';
-import { INTENTION } from './intentions.js';
+import { INTENTION, missionState } from './intentions.js';
 import { aStar } from './astar.js';
 import { explorePath, markVisited } from './explorer.js';
 import { manhattan } from './utils.js';
@@ -186,9 +186,19 @@ export async function executePlan(socket, intention) {
                     return picked && picked.length > 0;
                 }
                 if (intention.type === INTENTION.DELIVER) {
-                    await socket.emitPutdown();
-                    beliefs.carrying = [];
-                    beliefs.carriedParcels.clear();
+                    // STACK_SIZE: if we ended up carrying more than the required
+                    // amount (e.g. a tile held multiple parcels), only deliver
+                    // exactly `size` of them so deliveries stay in exact batches.
+                    let toDrop = beliefs.carrying;
+                    if (missionState.active && missionState.type === 'STACK_SIZE') {
+                        const required = missionState.params.size ?? 1;
+                        if (beliefs.carrying.length > required) {
+                            toDrop = beliefs.carrying.slice(0, required);
+                        }
+                    }
+                    await socket.emitPutdown(toDrop);
+                    beliefs.carrying = beliefs.carrying.filter(id => !toDrop.includes(id));
+                    for (const id of toDrop) beliefs.carriedParcels.delete(id);
                     return true;
                 }
             }

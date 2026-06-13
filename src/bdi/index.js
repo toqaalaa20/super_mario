@@ -41,9 +41,11 @@ socket.onMsg((id, name, msg) => {
         if (parsed.cmd === 'CLAIM' && name === process.env.LLM_AGENT_NAME) {
             const myIntent = getCurrentIntention();
             if (myIntent?.type === 'pickup' && myIntent.target?.id === parsed.parcelId) {
-                // BDI is already targeting this parcel — counter-claim so LLM backs off
-                socket.emitSay(id, JSON.stringify({ cmd: 'CLAIM', parcelId: parsed.parcelId }));
-                console.log('[BDI] Counter-claiming', parsed.parcelId, '— already targeting it');
+                // Already targeting the same parcel ourselves — let the server
+                // arbitrate who physically gets there first instead of trading
+                // CLAIM replies back and forth (which could ping-pong forever
+                // now that the LLM side also ignores claims on its own target).
+                console.log('[BDI] Ignoring CLAIM for', parsed.parcelId, '— already targeting it');
                 return;
             }
             beliefs.claimedByOther.set(id, parsed.parcelId);

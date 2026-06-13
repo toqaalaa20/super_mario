@@ -69,6 +69,7 @@ socket.on('map', (width, height, tiles) => {
 let loopRunning = false;
 let lastClaimedId = null;
 let handoffParcelId = null; // parcel just handed off to BDI via PICKUP_AND_DELIVER
+let handoffDropPos = null; // drop (x,y) for a handoff whose parcelId wasn't known yet
 let lastBdiPosition = null;
 const pendingSignalResolvers = [];
 let pendingAutoGreenMs = null; // set when mission text contains a duration
@@ -76,6 +77,21 @@ let pendingAutoGreenMs = null; // set when mission text contains a duration
 socket.onSensing(async ({ parcels, agents }) => {
     visibleParcels = parcels ?? [];
     updateFromSensing({ parcels, agents });
+
+    // If PICKUP_AND_DELIVER was sent without a resolved parcelId (the parcel
+    // wasn't visible in beliefs yet at putdown time), keep checking each tick
+    // for a parcel appearing at the drop point and claim it as soon as it does
+    // — otherwise our own reviseIntention() could re-pick-up the parcel we just
+    // handed off before it's marked as claimed.
+    if (handoffDropPos && !handoffParcelId) {
+        const atDrop = [...beliefs.parcels.values()]
+            .find(p => p.x === handoffDropPos.x && p.y === handoffDropPos.y && !p.carriedBy);
+        if (atDrop) {
+            handoffParcelId = atDrop.id;
+            handoffDropPos = null;
+            console.log(`[LLM] Resolved PICKUP_AND_DELIVER parcelId ${atDrop.id} from drop position`);
+        }
+    }
 
     // Keep treating the just-handed-off parcel as claimed by the BDI until it
     // actually picks it up. Without this, normal-operation reviseIntention()
@@ -113,13 +129,69 @@ socket.onSensing(async ({ parcels, agents }) => {
 
 // ─── Tools ────────────────────────────────────────────────────────────────────
 
+// Safe arithmetic evaluator — supports + - * / ( ) and numbers only.
+// Avoids eval() so chat-driven LLM input can never reach arbitrary JS execution.
 function calculate(expression) {
-    try { return String(eval(expression)); }
-    catch (e) { return `Error: ${e.message}`; }
+    try {
+        const tokens = expression.match(/\d+(?:\.\d+)?|[+\-*/()]/g) ?? [];
+        if (tokens.join('') !== expression.replace(/\s+/g, '')) {
+            return `Error: invalid characters in expression '${expression}'.`;
+        }
+
+        let pos = 0;
+        const peek = () => tokens[pos];
+        const next = () => tokens[pos++];
+
+        function parseExpr() {
+            let value = parseTerm();
+            while (peek() === '+' || peek() === '-') {
+                const op = next();
+                value = op === '+' ? value + parseTerm() : value - parseTerm();
+            }
+            return value;
+        }
+        function parseTerm() {
+            let value = parseFactor();
+            while (peek() === '*' || peek() === '/') {
+                const op = next();
+                value = op === '*' ? value * parseFactor() : value / parseFactor();
+            }
+            return value;
+        }
+        function parseFactor() {
+            if (peek() === '-') { next(); return -parseFactor(); }
+            if (peek() === '(') {
+                next();
+                const value = parseExpr();
+                if (next() !== ')') throw new Error('mismatched parentheses');
+                return value;
+            }
+            const tok = next();
+            if (tok === undefined || /[^0-9.]/.test(tok)) throw new Error(`unexpected token '${tok}'`);
+            return parseFloat(tok);
+        }
+
+        const result = parseExpr();
+        if (pos !== tokens.length) throw new Error('unexpected trailing input');
+        return String(result);
+    } catch (e) {
+        return `Error: ${e.message}`;
+    }
 }
 
 function manhattanDistance(args) {
-    const matches = [...args.matchAll(/=\s*(-?\d+)/g)].map(m => parseInt(m[1]));
+    // Prefer explicitly labeled x1/y1/x2/y2 — robust regardless of the order
+    // the LLM writes them in.
+    const named = {};
+    for (const m of args.matchAll(/(x1|y1|x2|y2)\s*=\s*(-?\d+)/gi)) {
+        named[m[1].toLowerCase()] = parseInt(m[2]);
+    }
+    if (['x1', 'y1', 'x2', 'y2'].every(k => k in named)) {
+        return String(manhattan({ x: named.x1, y: named.y1 }, { x: named.x2, y: named.y2 }));
+    }
+
+    // Fallback: take the four numbers in positional order.
+    const matches = [...args.matchAll(/-?\d+/g)].map(m => parseInt(m[0]));
     if (matches.length < 4) return `Error: could not parse two (x,y) pairs from '${args}'.`;
     const [ax, ay, bx, by] = matches;
     return String(manhattan({ x: ax, y: ay }, { x: bx, y: by }));
@@ -336,12 +408,19 @@ async function sendMissionToBDI(args) {
                     parsed.params = { ...parsed.params, parcelId: atDrop.id };
                     console.log(`[LLM] PICKUP_AND_DELIVER missing parcelId — inferred ${atDrop.id} from parcel at (${x},${y})`);
                 } else {
-                    console.warn(`[LLM] PICKUP_AND_DELIVER missing parcelId and no parcel found at (${x},${y}) — BDI mission may never resolve.`);
+                    // Sensing hasn't caught up to the parcel we just dropped yet.
+                    // Resolve it on a later sensing tick (see handoffDropPos check
+                    // in onSensing) instead of leaving the parcel unclaimed.
+                    handoffDropPos = { x, y };
+                    console.warn(`[LLM] PICKUP_AND_DELIVER missing parcelId and no parcel found at (${x},${y}) yet — will resolve from sensing.`);
                 }
             }
 
             handoffParcelId = parsed.params?.parcelId ?? null;
-            if (handoffParcelId) beliefs.claimedByOther.set('handoff', handoffParcelId);
+            if (handoffParcelId) {
+                handoffDropPos = null;
+                beliefs.claimedByOther.set('handoff', handoffParcelId);
+            }
         }
 
         const cmd = JSON.stringify({
@@ -634,7 +713,7 @@ async function processNextMission() {
     }
     // Track handoff missions so putdown() can refuse to drop on a delivery tile —
     // dropping there auto-delivers the parcel instead of leaving it for the BDI.
-    handoffMissionActive = /hand[\s-]?off|partner/i.test(msg);
+    handoffMissionActive = /hand[\s-]?off|partner|teammate|other agent|bdi|hand (it|this|that|over)/i.test(msg);
     missionRunning = true;
     try {
         const result = await runMissionTurn(`Special mission from ${name}: ${msg}`);
@@ -644,6 +723,9 @@ async function processNextMission() {
     } finally {
         missionRunning = false;
         handoffMissionActive = false;
+        // Don't let an unconsumed auto-green timer leak into the next,
+        // unrelated mission's wait_for_chat_signal('green') call.
+        pendingAutoGreenMs = null;
         processNextMission();
     }
 }
@@ -664,6 +746,15 @@ socket.onMsg(async (id, name, msg) => {
         }
 
         if (p.cmd === 'CLAIM' && name === process.env.BDI_AGENT_NAME) {
+            const myIntent = getCurrentIntention();
+            if (myIntent?.type === INTENTION.PICKUP && myIntent.target?.id === p.parcelId) {
+                // Already targeting the same parcel ourselves — let the server
+                // arbitrate who physically gets there first instead of always
+                // backing off (which previously made the LLM agent lose every
+                // contested parcel to the BDI).
+                console.log('[LLM] Ignoring CLAIM for', p.parcelId, '— already targeting it');
+                return;
+            }
             beliefs.claimedByOther.set(id, p.parcelId);
             console.log('[LLM] Received CLAIM from BDI:', p.parcelId);
             return;

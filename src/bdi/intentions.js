@@ -25,6 +25,11 @@ export const missionState = {
 
 export function setMissionState(state) {
     Object.assign(missionState, state);
+    // Don't let a stuck-tick count from a previous/cancelled PICKUP_AND_DELIVER
+    // mission carry over into a later one.
+    if (missionState.type !== 'PICKUP_AND_DELIVER') {
+        pickupAndDeliverStuckTicks = 0;
+    }
     console.log('[INTENTION] Mission state updated:', missionState);
 }
 
