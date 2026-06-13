@@ -1,6 +1,12 @@
 // intentions.js
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import { beliefs, freeParcels, deliveryTiles, totalCarriedReward } from './beliefs.js';
 import { manhattan } from './utils.js';
+import { buildProblem } from './pddl/problemGenerator.js';
+import { solve } from './pddl/plannerClient.js';
+import { translatePlan } from './pddl/planTranslator.js';
 
 export const INTENTION = {
     PICKUP: 'pickup',
@@ -12,6 +18,62 @@ export const INTENTION = {
 
 let current = null;
 let pickupAndDeliverStuckTicks = 0;
+
+// ─── PDDL-based pickup/delivery sequencing ─────────────────────────────────
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const DOMAIN_PDDL = fs.readFileSync(path.join(__dirname, 'pddl', 'domain.pddl'), 'utf-8');
+const PDDL_ENABLED = process.env.PDDL_ENABLED !== 'false';
+
+let plannedQueue = [];
+let plannerStatus = 'idle'; // 'idle' | 'pending'
+let lastPlannedSignature = null;
+
+/** Cheap fingerprint of the world state, used to decide when to replan */
+function computeSignature() {
+    const carrying = [...beliefs.carrying].sort().join(',');
+    const free = freeParcels()
+        .filter(p => p.reward > 5 && parcelAllowed(p))
+        .map(p => p.id).sort().join(',');
+    return `${missionState.type ?? 'none'}|${carrying}|${free}`;
+}
+
+/** True if the head of the planned queue still refers to something achievable */
+function queueHeadValid() {
+    const head = plannedQueue[0];
+    if (!head) return false;
+    if (head.type === INTENTION.PICKUP) {
+        return freeParcels().some(p => p.id === head.target.id);
+    }
+    if (head.type === INTENTION.DELIVER) {
+        return filterAvoidedTiles(deliveryTiles())
+            .some(t => t.x === head.target.x && t.y === head.target.y);
+    }
+    return false;
+}
+
+/** Fire-and-forget: ask the external PDDL solver for an optimized pickup/delivery sequence */
+async function triggerReplan(signature) {
+    plannerStatus = 'pending';
+    try {
+        const built = buildProblem();
+        if (built) {
+            const result = await solve(DOMAIN_PDDL, built.problem);
+            if (result?.plan?.length) {
+                const translated = translatePlan(result.plan, built);
+                if (translated.length) {
+                    plannedQueue = translated;
+                    console.log('[PDDL] Plan received:', translated.map(i =>
+                        `${i.type}(${i.target?.id ?? `${i.target?.x},${i.target?.y}`})`).join(' -> '));
+                }
+            }
+        }
+    } catch (err) {
+        console.warn('[PDDL] replan failed:', err.message);
+    } finally {
+        lastPlannedSignature = signature;
+        plannerStatus = 'idle';
+    }
+}
 
 export function getCurrentIntention() { return current; }
 
@@ -37,6 +99,9 @@ export function setMissionState(state) {
 export function resetState() {
     current = null;
     pickupAndDeliverStuckTicks = 0;
+    plannedQueue = [];
+    plannerStatus = 'idle';
+    lastPlannedSignature = null;
     Object.assign(missionState, { active: false, type: null, params: {}, description: '' });
 }
 
@@ -59,7 +124,7 @@ function isAvoidedTile(x, y) {
 }
 
 /** Apply SCORE_FILTER: skip parcels whose reward exceeds the cap */
-function parcelAllowed(parcel) {
+export function parcelAllowed(parcel) {
     if (missionState.active && missionState.type === 'SCORE_FILTER') {
         if (parcel.reward > (missionState.params.maxReward ?? Infinity)) return false;
     }
@@ -68,7 +133,7 @@ function parcelAllowed(parcel) {
 }
 
 /** Filter out delivery tiles that fall on an avoided tile */
-function filterAvoidedTiles(tiles) {
+export function filterAvoidedTiles(tiles) {
     if (missionState.active && missionState.type === 'AVOID_TILE') {
         return tiles.filter(t => !isAvoidedTile(t.x, t.y));
     }
@@ -76,7 +141,7 @@ function filterAvoidedTiles(tiles) {
 }
 
 /** Apply PREFERRED_DELIVERY: sort preferred tiles first */
-function sortDeliveryTiles(tiles, me) {
+export function sortDeliveryTiles(tiles, me) {
     if (missionState.active && missionState.type === 'PREFERRED_DELIVERY') {
         const preferred = missionState.params.tiles ?? [];
         return tiles.sort((a, b) => {
@@ -214,8 +279,36 @@ export function reviseIntention() {
 
     let nextIntention = null;
 
+    // ── PDDL-planned sequence ─────────────────────────────────────────────────
+    // Pop steps of the previously-solved plan as they complete.
+    while (plannedQueue.length) {
+        const head = plannedQueue[0];
+        if (head.type === INTENTION.PICKUP && beliefs.carrying.includes(head.target.id)) {
+            plannedQueue.shift();
+            continue;
+        }
+        if (head.type === INTENTION.DELIVER && beliefs.carrying.length === 0) {
+            plannedQueue.shift();
+            continue;
+        }
+        break;
+    }
+
+    if (plannedQueue.length && !queueHeadValid()) {
+        plannedQueue = [];
+    }
+
+    if (plannedQueue.length) {
+        nextIntention = plannedQueue[0];
+    } else {
+        const signature = computeSignature();
+        if (PDDL_ENABLED && plannerStatus === 'idle' && signature !== lastPlannedSignature) {
+            triggerReplan(signature);
+        }
+    }
+
     // ── 1. Carrying parcels ──────────────────────────────────────────────────
-    if (beliefs.carrying.length > 0) {
+    if (!nextIntention && beliefs.carrying.length > 0) {
         const allDelivery = filterAvoidedTiles(deliveryTiles());
         const sortedDelivery = sortDeliveryTiles(allDelivery, me);
         const nearestDelivery = sortedDelivery[0];
