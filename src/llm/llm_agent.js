@@ -325,6 +325,21 @@ async function sendMissionToBDI(args) {
                 // PICKUP_AND_DELIVER mission would wait forever for a parcel that's gone.
                 console.warn(`[LLM] PICKUP_AND_DELIVER drop point (${x},${y}) is a delivery tile — the parcel was likely auto-delivered on putdown, not handed off.`);
             }
+
+            // The LLM sometimes omits parcelId. Without it, the BDI's CLAIM carries
+            // id=undefined (claims nothing) and our local handoff-claim below can't
+            // activate either, so this agent's own loop re-picks-up and delivers the
+            // parcel itself. Infer it from whatever was just dropped at (x,y).
+            if (!parsed.params?.parcelId) {
+                const atDrop = [...beliefs.parcels.values()].find(p => p.x === x && p.y === y && !p.carriedBy);
+                if (atDrop) {
+                    parsed.params = { ...parsed.params, parcelId: atDrop.id };
+                    console.log(`[LLM] PICKUP_AND_DELIVER missing parcelId — inferred ${atDrop.id} from parcel at (${x},${y})`);
+                } else {
+                    console.warn(`[LLM] PICKUP_AND_DELIVER missing parcelId and no parcel found at (${x},${y}) — BDI mission may never resolve.`);
+                }
+            }
+
             handoffParcelId = parsed.params?.parcelId ?? null;
             if (handoffParcelId) beliefs.claimedByOther.set('handoff', handoffParcelId);
         }
