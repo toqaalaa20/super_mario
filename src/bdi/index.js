@@ -68,13 +68,13 @@ socket.onMsg((id, name, msg) => {
             console.log('[BDI] Mission cleared by LLM agent');
         }
     } catch {
-        // Not a command message — ignore
-    }
-
-    // Green-light signal for WAIT_FOR_SIGNAL mission (plain-text game message)
-    if (missionState.type === 'WAIT_FOR_SIGNAL' && msg.toLowerCase().includes('green')) {
-        setMissionState({ ...missionState, params: { ...missionState.params, frozen: false } });
-        console.log('[BDI] Green light received — unfreezing');
+        // Not a command message — plain chat text. Check for the green-light signal here
+        // so it can't be triggered by the JSON MISSION command that sets up WAIT_FOR_SIGNAL
+        // (whose description may itself contain the word "green").
+        if (missionState.type === 'WAIT_FOR_SIGNAL' && msg.toLowerCase().includes('green')) {
+            setMissionState({ ...missionState, params: { ...missionState.params, frozen: false } });
+            console.log('[BDI] Green light received — unfreezing');
+        }
     }
 });
 

@@ -5,6 +5,7 @@ import { beliefs, updateFromSensing, setMap } from '../bdi/beliefs.js';
 import { reviseIntention, getCurrentIntention, INTENTION, setMissionState, missionState } from '../bdi/intentions.js';
 import { executePlan } from '../bdi/executor.js';
 import { explorePath } from '../bdi/explorer.js';
+import { manhattan } from '../bdi/utils.js';
 
 // ─── LLM client ───────────────────────────────────────────────────────────────
 
@@ -61,10 +62,13 @@ function waitForPositionUpdate(timeoutMs = 1000) {
 socket.on('map', (width, height, tiles) => {
     mapTiles = tiles;
     setMap(tiles);
+    const deliveryTiles = tiles.filter(t => t.delivery === true || t.type === '2').map(t => ({ x: t.x, y: t.y }));
+    console.log('[LLM] Delivery tiles:', deliveryTiles);
 });
 
 let loopRunning = false;
 let lastClaimedId = null;
+let handoffParcelId = null; // parcel just handed off to BDI via PICKUP_AND_DELIVER
 let lastBdiPosition = null;
 const pendingSignalResolvers = [];
 let pendingAutoGreenMs = null; // set when mission text contains a duration
@@ -72,6 +76,18 @@ let pendingAutoGreenMs = null; // set when mission text contains a duration
 socket.onSensing(async ({ parcels, agents }) => {
     visibleParcels = parcels ?? [];
     updateFromSensing({ parcels, agents });
+
+    // Keep treating the just-handed-off parcel as claimed by the BDI until it
+    // actually picks it up. Without this, normal-operation reviseIntention()
+    // can re-pick-up and self-deliver the parcel before the BDI's own CLAIM
+    // message round-trips back to us.
+    if (handoffParcelId) {
+        if (beliefs.parcels.has(handoffParcelId)) {
+            beliefs.claimedByOther.set('handoff', handoffParcelId);
+        } else {
+            handoffParcelId = null;
+        }
+    }
 
     if (missionRunning || loopRunning || !beliefs.me) return;
     loopRunning = true;
@@ -100,6 +116,13 @@ socket.onSensing(async ({ parcels, agents }) => {
 function calculate(expression) {
     try { return String(eval(expression)); }
     catch (e) { return `Error: ${e.message}`; }
+}
+
+function manhattanDistance(args) {
+    const matches = [...args.matchAll(/=\s*(-?\d+)/g)].map(m => parseInt(m[1]));
+    if (matches.length < 4) return `Error: could not parse two (x,y) pairs from '${args}'.`;
+    const [ax, ay, bx, by] = matches;
+    return String(manhattan({ x: ax, y: ay }, { x: bx, y: by }));
 }
 
 function snapPosition() {
@@ -176,11 +199,37 @@ async function moveTo(args) {
     return `Stopped at (${mx}, ${my}). Target was (${tx}, ${ty}).`;
 }
 
+// Repeatedly walk toward exploration frontiers in a single tool call, instead of
+// requiring one LLM round-trip per frontier (which made exploration very slow).
+// Stops early if a profitable parcel comes into view.
+const EXPLORE_STEP_BUDGET = 15;
+
 async function explore() {
-    const current = snapPosition();
-    if (!current) return 'Error: position not available yet.';
-    const path = explorePath(current);
-    return followPath(path, 'exploration');
+    let totalSteps = 0;
+    let lastPos = null;
+
+    while (totalSteps < EXPLORE_STEP_BUDGET) {
+        if (visibleParcels.some(p => !p.carriedBy && p.reward > 5)) {
+            return `Stopped exploring after ${totalSteps} step(s) — a parcel is now visible. Current position: (${Math.round(me.x)}, ${Math.round(me.y)}).`;
+        }
+
+        const current = snapPosition();
+        if (!current) return 'Error: position not available yet.';
+        const path = explorePath(current);
+        if (path.length === 0) break;
+
+        const direction = path[0];
+        const ok = await applyMove(direction);
+        if (!ok) break;
+        totalSteps++;
+
+        const pos = `${me.x},${me.y}`;
+        if (pos === lastPos) break; // not actually moving — avoid spinning in place
+        lastPos = pos;
+    }
+
+    if (totalSteps === 0) return 'Error: no exploration path found.';
+    return `Completed exploration: ${totalSteps} step(s). Current position: (${Math.round(me.x)}, ${Math.round(me.y)}).`;
 }
 
 async function pickup() {
@@ -191,8 +240,25 @@ async function pickup() {
 }
 
 async function putdown() {
+    if (handoffMissionActive) {
+        const pos = snapPosition();
+        const tile = pos && beliefs.map.find(t => t.x === pos.x && t.y === pos.y);
+        if (tile && (tile.delivery === true || tile.type === '2')) {
+            return `Error: (${pos.x},${pos.y}) is a delivery tile — putting the parcel down here would auto-deliver it immediately, leaving nothing for the BDI to pick up. Use move_to to reach a non-delivery tile first (check get_delivery_tiles()), then call putdown() again.`;
+        }
+    }
     const result = await socket.emitPutdown();
-    return result ? 'Put down all carried parcels.' : 'Error: putdown failed.';
+    if (result && result.length > 0) {
+        // emitPutdown() with no args drops everything we're carrying — mirror that
+        // in beliefs so reviseIntention() doesn't think we still have cargo to
+        // deliver once the mission turn ends and normal sensing resumes.
+        for (const p of result) {
+            beliefs.carrying = beliefs.carrying.filter(id => id !== p.id);
+            beliefs.carriedParcels.delete(p.id);
+        }
+        return `Put down ${result.length} parcel(s): ${result.map(p => p.id).join(', ')}.`;
+    }
+    return 'No parcels to put down.';
 }
 
 function getVisibleParcels() {
@@ -236,6 +302,33 @@ async function sendChatMessage(msg) {
 async function sendMissionToBDI(args) {
     try {
         const parsed = typeof args === 'string' ? JSON.parse(args) : args;
+
+        if (parsed.type === 'PREFERRED_DELIVERY') {
+            const deliveryCoords = new Set(
+                mapTiles
+                    .filter(t => t.delivery === true || t.type === '2')
+                    .map(t => `${t.x},${t.y}`)
+            );
+            const requested = parsed.params?.tiles ?? [];
+            const unknown = requested.filter(t => !deliveryCoords.has(`${t.x},${t.y}`));
+            if (unknown.length > 0) {
+                console.warn('[LLM] PREFERRED_DELIVERY requested tile(s) not on the map\'s delivery tiles:', unknown);
+            }
+        }
+
+        if (parsed.type === 'PICKUP_AND_DELIVER') {
+            const { x, y } = parsed.params ?? {};
+            const dropTile = mapTiles.find(t => t.x === x && t.y === y);
+            if (dropTile && (dropTile.delivery === true || dropTile.type === '2')) {
+                // putdown() on a delivery tile auto-delivers the parcel to the server —
+                // there will be nothing left at (x,y) for the BDI to pick up, so its
+                // PICKUP_AND_DELIVER mission would wait forever for a parcel that's gone.
+                console.warn(`[LLM] PICKUP_AND_DELIVER drop point (${x},${y}) is a delivery tile — the parcel was likely auto-delivered on putdown, not handed off.`);
+            }
+            handoffParcelId = parsed.params?.parcelId ?? null;
+            if (handoffParcelId) beliefs.claimedByOther.set('handoff', handoffParcelId);
+        }
+
         const cmd = JSON.stringify({
             cmd: 'MISSION',
             type: parsed.type,
@@ -244,13 +337,17 @@ async function sendMissionToBDI(args) {
         });
         if (bdiAgentId) await socket.emitSay(bdiAgentId, cmd);
         else await socket.emitShout(cmd); // fallback if BDI not yet seen
-        // Apply the same mission state locally so this agent's sensing loop also respects it
-        setMissionState({
-            active: true,
-            type: parsed.type,
-            params: parsed.params ?? {},
-            description: parsed.description ?? '',
-        });
+        // Apply the same mission state locally so this agent's sensing loop also respects it.
+        // PICKUP_AND_DELIVER is asymmetric — it tells the BDI to pick up the parcel we just
+        // dropped off, so we must NOT also adopt it ourselves (we'd race the BDI for it).
+        if (parsed.type !== 'PICKUP_AND_DELIVER') {
+            setMissionState({
+                active: true,
+                type: parsed.type,
+                params: parsed.params ?? {},
+                description: parsed.description ?? '',
+            });
+        }
         console.log('[LLM] Mission command sent to BDI:', cmd);
         return `Mission sent to BDI agent: ${parsed.description}`;
     } catch (e) {
@@ -263,6 +360,15 @@ async function getBdiPosition() {
     return JSON.stringify(lastBdiPosition);
 }
 
+// Unfreeze our own WAIT_FOR_SIGNAL mission state, mirroring the BDI's green-light
+// handling — otherwise reviseIntention() keeps freezing us in WAIT after the signal.
+function unfreezeOnGreen(keyword) {
+    if (keyword.trim().toLowerCase() === 'green' && missionState.type === 'WAIT_FOR_SIGNAL') {
+        setMissionState({ ...missionState, params: { ...missionState.params, frozen: false } });
+        console.log('[LLM] Green light received — unfreezing own mission state');
+    }
+}
+
 async function waitForChatSignal(keyword) {
     const kw = keyword.trim().toLowerCase();
 
@@ -271,6 +377,7 @@ async function waitForChatSignal(keyword) {
     if (queueIdx !== -1) {
         const { msg } = missionQueue.splice(queueIdx, 1)[0];
         console.log(`[LLM] Signal "${keyword}" found in mission queue — resolving immediately`);
+        unfreezeOnGreen(keyword);
         return `Signal received: "${msg}"`;
     }
 
@@ -314,6 +421,7 @@ async function clearMissionOnBDI() {
 
 const TOOLS = {
     calculate,
+    manhattan_distance: manhattanDistance,
     get_my_position: getMyPosition,
     move_to: moveTo,
     explore,
@@ -338,7 +446,8 @@ You are one of two agents: you (LLM agent) and a BDI agent running separately.
 You can send mission commands to the BDI agent via send_mission_to_bdi to coordinate behaviour.
 
 Available tools:
-- calculate(expression): evaluate math expressions
+- calculate(expression): evaluate basic arithmetic expressions (+ - * / only — NO function calls like abs() or manhattan_distance(), these are NOT valid inside calculate)
+- manhattan_distance(x1=A,y1=B,x2=C,y2=D): compute the Manhattan distance |x1-x2| + |y1-y2| between two points. This is its own Action — call it directly as "Action: manhattan_distance", never inside calculate.
 - get_my_position(): get your current (x, y) and score
 - move_to(x=N,y=M): navigate to a target tile using the BDI A* planner. Input example: x=14, y=12
 - explore(): use the BDI explorer + A* planner to move toward an unexplored frontier
@@ -383,9 +492,9 @@ Mission decision rules:
   * "Stop for N seconds": call wait_for_chat_signal("green") — the green signal fires automatically after N seconds.
 - For Level 2 persistent missions (e.g. "deliver stacks of 3 to double reward"): call send_mission_to_bdi() to instruct the BDI agent, then give Final Answer immediately.
 - For Level 3 coordination missions:
-  * COORDINATE_MEETUP: (1) call send_mission_to_bdi with type COORDINATE_MEETUP so the BDI starts moving there; (2) call move_to to navigate yourself to the same (x,y); (3) poll get_bdi_position() and get_my_position(), calculate manhattan distance (|ax-x|+|ay-y|) for each agent, and confirm BOTH are within radius 3 of the target; (4) only then give Final Answer.
+  * COORDINATE_MEETUP: (1) call send_mission_to_bdi with type COORDINATE_MEETUP so the BDI starts moving there; (2) call move_to to navigate yourself to the same (x,y); (3) poll get_bdi_position() and get_my_position(), use manhattan_distance(x1=...,y1=...,x2=...,y2=...) for each agent vs the target, and confirm BOTH are within radius 3 of the target; (4) once confirmed, call clear_mission_on_bdi() so the BDI resumes normal behaviour, then give Final Answer. The BDI freezes in place once it enters the radius and will NOT resume until clear_mission_on_bdi() is called — do not delay this step.
   * WAIT_FOR_SIGNAL (red-light/green-light): BOTH agents must be on an odd-numbered row (y % 2 !== 0) and frozen before the green light. Steps: (1) call send_mission_to_bdi with type WAIT_FOR_SIGNAL so BDI starts moving to an odd row; (2) call get_my_position() to check your own y — if y is even, call move_to(x=<your_x>, y=<your_y+1>) to step onto the next odd row; (3) call wait_for_chat_signal("green") to freeze yourself until the signal arrives; (4) give Final Answer after the signal is received.
-  * PARCEL_HANDOFF (you pick up, BDI delivers): (1) call pickup() on the target parcel; (2) call move_to to navigate to a convenient intermediate position; (3) call putdown() to drop the parcel; (4) call get_my_position() to get the exact drop coordinates; (5) call send_mission_to_bdi({ type: "PICKUP_AND_DELIVER", params: { parcelId: "<id>", x: <drop_x>, y: <drop_y> } }) — BDI will navigate to the drop point, pick up the parcel, and deliver it autonomously; (6) give Final Answer immediately.
+  * PARCEL_HANDOFF (you pick up, BDI delivers): (1) call pickup() on the target parcel; (2) call move_to to navigate to a convenient intermediate position that is NOT a delivery tile (check with get_delivery_tiles() — putting the parcel down on a delivery tile auto-delivers it immediately, so there would be nothing left for the BDI to hand off); (3) call putdown() to drop the parcel; (4) call get_my_position() to get the exact drop coordinates; (5) call send_mission_to_bdi({ type: "PICKUP_AND_DELIVER", params: { parcelId: "<id>", x: <drop_x>, y: <drop_y> } }) — BDI will navigate to the drop point, pick up the parcel, and deliver it autonomously; (6) give Final Answer immediately.
 - After completing a mission, your Final Answer text is automatically broadcast to the game chat — do NOT call send_chat_message to report the result (that would double-send). Use send_chat_message only for mid-mission status messages.
 
 STRICT OUTPUT FORMAT — use exactly one format per message:
@@ -412,8 +521,9 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 function extractAction(text) {
     const a = text.match(/^Action:\s*(.+)$/im);
-    const i = text.match(/^Action Input:\s*([\s\S]+?)(?=\n(?:Thought|Action|Final Answer)|$)/im);
-    return (a && i) ? { action: a[1].trim(), actionInput: i[1].trim() } : null;
+    if (!a) return null;
+    const i = text.match(/^Action Input:\s*([\s\S]*?)(?=\n(?:Thought|Action|Final Answer)|$)/im);
+    return { action: a[1].trim(), actionInput: i ? i[1].trim() : '' };
 }
 
 function extractFinalAnswer(text) {
@@ -494,6 +604,7 @@ async function runMissionTurn(userInput, maxIterations = 100) {
 // ─── Chat listener ─────────────────────────────────────────────────────────────
 
 let missionRunning = false;
+let handoffMissionActive = false;
 let bdiAgentId = null; // learned from first message received from BDI
 const missionQueue = [];
 
@@ -505,6 +616,9 @@ async function processNextMission() {
         pendingAutoGreenMs = parseFloat(timeMatch[1]) * 1000;
         console.log(`[LLM] Auto-green will fire ${timeMatch[1]}s after wait begins`);
     }
+    // Track handoff missions so putdown() can refuse to drop on a delivery tile —
+    // dropping there auto-delivers the parcel instead of leaving it for the BDI.
+    handoffMissionActive = /hand[\s-]?off|partner/i.test(msg);
     missionRunning = true;
     try {
         const result = await runMissionTurn(`Special mission from ${name}: ${msg}`);
@@ -513,6 +627,7 @@ async function processNextMission() {
         console.error('[LLM ERROR]', err);
     } finally {
         missionRunning = false;
+        handoffMissionActive = false;
         processNextMission();
     }
 }
@@ -548,6 +663,7 @@ socket.onMsg(async (id, name, msg) => {
     let resolvedSignal = false;
     for (let i = pendingSignalResolvers.length - 1; i >= 0; i--) {
         if (msg.toLowerCase().includes(pendingSignalResolvers[i].keyword)) {
+            unfreezeOnGreen(pendingSignalResolvers[i].keyword);
             pendingSignalResolvers[i].resolve(msg);
             pendingSignalResolvers.splice(i, 1);
             resolvedSignal = true;
@@ -558,6 +674,14 @@ socket.onMsg(async (id, name, msg) => {
 
     // Don't queue signal messages as new missions — they've done their job
     if (resolvedSignal) return;
+
+    // Green light may arrive even if wait_for_chat_signal was never called
+    // (e.g. the mission turn ended before reaching that step). Unfreeze and
+    // don't treat it as a new mission.
+    if (missionState.active && missionState.type === 'WAIT_FOR_SIGNAL' && msg.toLowerCase().includes('green')) {
+        unfreezeOnGreen('green');
+        return;
+    }
 
     const adminName = process.env.ADMIN_NAME;
     if (adminName && name !== adminName) {

@@ -2,6 +2,7 @@ import { beliefs, freeParcels, isWalkable } from './beliefs.js';
 import { INTENTION } from './intentions.js';
 import { aStar } from './astar.js';
 import { explorePath, markVisited } from './explorer.js';
+import { manhattan } from './utils.js';
 
 // Snap fractional coords to nearest integer (agent mid-step)
 function snapPosition(me) {
@@ -76,7 +77,10 @@ export async function executePlan(socket, intention) {
 
     // --- EXPLORE: one step at a time, abort if a parcel appears ---
     if (intention.type === INTENTION.EXPLORE) {
-        if (cachedPath.length === 0) return false;
+        if (cachedPath.length === 0) {
+            console.log(`[EXECUTOR] ${me.name} EXPLORE: no path/frontier from (${me.x},${me.y}) — idling`);
+            return false;
+        }
 
         if (freeParcels().some(p => p.reward > 5)) {
             cachedPath = [];
@@ -142,7 +146,23 @@ export async function executePlan(socket, intention) {
         const dist = Math.abs(me.x - intention.target.x) + Math.abs(me.y - intention.target.y);
         if (dist <= radius) return true;
 
-        if (cachedPath.length === 0) return false;
+        if (cachedPath.length === 0) {
+            // No path to target (likely blocked by another agent on the only route) —
+            // reuse the same explorer fallback the BDI uses to take an unstuck step,
+            // then force a path recompute next tick.
+            const dodgePath = explorePath(me);
+            if (dodgePath.length > 0) {
+                const d = dodgePath[0];
+                const ok = await socket.emitMove(d);
+                if (ok) {
+                    console.log(`[EXECUTOR] ${me.name} MEETUP dodged ${d}: blocked path to (${intention.target.x},${intention.target.y})`);
+                    rememberMove(nextPosition(me, d));
+                    cachedIntentionKey = null; // force path recompute next tick
+                    return true;
+                }
+            }
+            return false;
+        }
         const dir = cachedPath.shift();
         const next = nextPosition(me, dir);
         const ok = await socket.emitMove(dir);
@@ -159,17 +179,36 @@ export async function executePlan(socket, intention) {
     // --- PICKUP / DELIVER: one move step per tick ---
     if (intention.type === INTENTION.PICKUP || intention.type === INTENTION.DELIVER) {
         if (cachedPath.length === 0) {
-            // Already at target — perform the action
-            if (intention.type === INTENTION.PICKUP) {
-                const picked = await socket.emitPickup();
-                return picked && picked.length > 0;
+            if (manhattan(me, intention.target) === 0) {
+                // Already at target — perform the action
+                if (intention.type === INTENTION.PICKUP) {
+                    const picked = await socket.emitPickup();
+                    return picked && picked.length > 0;
+                }
+                if (intention.type === INTENTION.DELIVER) {
+                    await socket.emitPutdown();
+                    beliefs.carrying = [];
+                    beliefs.carriedParcels.clear();
+                    return true;
+                }
             }
-            if (intention.type === INTENTION.DELIVER) {
-                await socket.emitPutdown();
-                beliefs.carrying = [];
-                beliefs.carriedParcels.clear();
-                return true;
+
+            // No path to target (likely blocked by the other agent) — dodge via
+            // the shared explorer fallback and force a path recompute next tick,
+            // instead of misreading "no path" as "arrived" and pickup/putdown-ing
+            // in place forever.
+            const dodgePath = explorePath(me);
+            if (dodgePath.length > 0) {
+                const d = dodgePath[0];
+                const ok = await socket.emitMove(d);
+                if (ok) {
+                    console.log(`[EXECUTOR] ${me.name} ${intention.type} dodged ${d}: blocked path to (${intention.target.x},${intention.target.y})`);
+                    rememberMove(nextPosition(me, d));
+                    cachedIntentionKey = null;
+                    return true;
+                }
             }
+            return false;
         }
 
         const dir = cachedPath.shift();

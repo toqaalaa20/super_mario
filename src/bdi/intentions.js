@@ -11,6 +11,7 @@ export const INTENTION = {
 };
 
 let current = null;
+let pickupAndDeliverStuckTicks = 0;
 
 export function getCurrentIntention() { return current; }
 
@@ -30,17 +31,43 @@ export function setMissionState(state) {
 // Reset module-level state — used by tests to isolate cases
 export function resetState() {
     current = null;
+    pickupAndDeliverStuckTicks = 0;
     Object.assign(missionState, { active: false, type: null, params: {}, description: '' });
 }
 
 // ─── Mission-aware helpers ─────────────────────────────────────────────────────
 
+/** True if any other known agent is within radius of (x,y) */
+function partnerNearby(x, y, radius) {
+    for (const a of beliefs.agents.values()) {
+        if (manhattan(a, { x, y }) <= radius) return true;
+    }
+    return false;
+}
+
+/** True if (x,y) is the tile an active AVOID_TILE mission says to avoid */
+function isAvoidedTile(x, y) {
+    if (missionState.active && missionState.type === 'AVOID_TILE') {
+        return missionState.params.x === x && missionState.params.y === y;
+    }
+    return false;
+}
+
 /** Apply SCORE_FILTER: skip parcels whose reward exceeds the cap */
 function parcelAllowed(parcel) {
     if (missionState.active && missionState.type === 'SCORE_FILTER') {
-        return parcel.reward <= (missionState.params.maxReward ?? Infinity);
+        if (parcel.reward > (missionState.params.maxReward ?? Infinity)) return false;
     }
+    if (isAvoidedTile(parcel.x, parcel.y)) return false;
     return true;
+}
+
+/** Filter out delivery tiles that fall on an avoided tile */
+function filterAvoidedTiles(tiles) {
+    if (missionState.active && missionState.type === 'AVOID_TILE') {
+        return tiles.filter(t => !isAvoidedTile(t.x, t.y));
+    }
+    return tiles;
 }
 
 /** Apply PREFERRED_DELIVERY: sort preferred tiles first */
@@ -79,10 +106,23 @@ export function reviseIntention() {
 
     // Remove filtered parcels from beliefs so freeParcels() callers all see the same set
     // and the agent explores instead of idling near disallowed parcels.
-    if (missionState.active && missionState.type === 'SCORE_FILTER') {
+    if (missionState.active && (missionState.type === 'SCORE_FILTER' || missionState.type === 'AVOID_TILE')) {
         for (const [id, p] of beliefs.parcels) {
-            if (!parcelAllowed(p)) beliefs.parcels.delete(id);
+            if (!parcelAllowed(p)) {
+                console.log(`[AVOID_TILE/SCORE_FILTER] dropping parcel ${id} at (${p.x},${p.y})`);
+                beliefs.parcels.delete(id);
+            }
         }
+    }
+
+    if (missionState.active && missionState.type === 'AVOID_TILE') {
+        const { x, y } = missionState.params;
+        const remainingDelivery = filterAvoidedTiles(deliveryTiles());
+        console.log(
+            `[AVOID_TILE] avoiding (${x},${y}) — ` +
+            `${remainingDelivery.length}/${deliveryTiles().length} delivery tiles remain, ` +
+            `${freeParcels().filter(parcelAllowed).length}/${freeParcels().length} free parcels remain`
+        );
     }
 
     // ── 0. Level 3 mission overrides ─────────────────────────────────────────
@@ -90,7 +130,14 @@ export function reviseIntention() {
         if (missionState.type === 'COORDINATE_MEETUP') {
             const { x, y, radius = 3 } = missionState.params;
             if (manhattan(me, { x, y }) <= radius) {
-                current = { type: INTENTION.WAIT, target: { x, y } };
+                // Within radius — freeze and wait for the LLM to confirm both agents
+                // have met and call clear_mission_on_bdi(). Don't auto-clear here:
+                // that would let the BDI wander off again before the LLM verifies.
+                const changed = !current || current.type !== INTENTION.WAIT;
+                if (changed) {
+                    console.log(`[MISSION] COORDINATE_MEETUP: reached (${x},${y}) within radius ${radius} — waiting for LLM confirmation`);
+                    current = { type: INTENTION.WAIT, target: { x, y } };
+                }
             } else {
                 const changed = !current || current.type !== INTENTION.MEETUP
                     || current.target?.x !== x || current.target?.y !== y;
@@ -104,8 +151,23 @@ export function reviseIntention() {
             if (beliefs.carrying.includes(parcelId)) {
                 // Holding the handoff parcel — clear mission, fall through to normal DELIVER
                 setMissionState({ active: false, type: null, params: {}, description: '' });
+                pickupAndDeliverStuckTicks = 0;
+            } else if (!beliefs.parcels.has(parcelId) && manhattan(me, { x, y }) === 0) {
+                // At the drop point but the parcel isn't there (e.g. it was put down
+                // on a delivery tile and auto-delivered already). Give up after a few
+                // ticks instead of waiting forever for a parcel that's never coming.
+                pickupAndDeliverStuckTicks++;
+                if (pickupAndDeliverStuckTicks >= 3) {
+                    console.log(`[PICKUP_AND_DELIVER] parcel ${parcelId} not found at (${x},${y}) — giving up on handoff`);
+                    setMissionState({ active: false, type: null, params: {}, description: '' });
+                    pickupAndDeliverStuckTicks = 0;
+                } else {
+                    current = { type: INTENTION.WAIT, target: null };
+                    return;
+                }
             } else {
                 // Not yet carrying — navigate to drop point and pick it up
+                pickupAndDeliverStuckTicks = 0;
                 const parcel = beliefs.parcels.get(parcelId) ?? { id: parcelId, x, y };
                 const changed = !current || current.type !== INTENTION.PICKUP
                     || current.target?.id !== parcelId;
@@ -149,7 +211,7 @@ export function reviseIntention() {
 
     // ── 1. Carrying parcels ──────────────────────────────────────────────────
     if (beliefs.carrying.length > 0) {
-        const allDelivery = deliveryTiles();
+        const allDelivery = filterAvoidedTiles(deliveryTiles());
         const sortedDelivery = sortDeliveryTiles(allDelivery, me);
         const nearestDelivery = sortedDelivery[0];
         const carried = totalCarriedReward();
@@ -193,9 +255,11 @@ export function reviseIntention() {
                 nextIntention = { type: INTENTION.DELIVER, target: nearestDelivery };
             }
         } else {
-            // STACK_SIZE: not enough parcels yet — go collect more first
+            // STACK_SIZE: not enough parcels yet — go collect more first.
+            // Don't fall back to delivering an incomplete stack; explore until
+            // enough parcels are found so deliveries always happen in exact batches.
             const candidates = freeParcels()
-                .filter(p => p.reward > 5 && parcelAllowed(p))
+                .filter(parcelAllowed)
                 .sort((a, b) => {
                     const sA = a.reward / (manhattan(me, a) + 1);
                     const sB = b.reward / (manhattan(me, b) + 1);
@@ -203,9 +267,8 @@ export function reviseIntention() {
                 });
             if (candidates.length > 0) {
                 nextIntention = { type: INTENTION.PICKUP, target: candidates[0] };
-            } else if (nearestDelivery) {
-                // No more parcels visible — deliver what we have even if stack incomplete
-                nextIntention = { type: INTENTION.DELIVER, target: nearestDelivery };
+            } else {
+                nextIntention = { type: INTENTION.EXPLORE, target: null };
             }
         }
     }
@@ -239,13 +302,13 @@ export function reviseIntention() {
         current.target?.y !== nextIntention.target?.y;
 
     if (changed) {
-        // console.log(
-        //     `[INTENTION] ${current?.type || 'NONE'} -> ${nextIntention.type}`,
-        //     nextIntention.target
-        //         ? `(target: ${nextIntention.target.x},${nextIntention.target.y})`
-        //         : '',
-        //     missionState.active ? `[MISSION: ${missionState.description}]` : '',
-        // );
+        console.log(
+            `[INTENTION] ${current?.type || 'NONE'} -> ${nextIntention.type}`,
+            nextIntention.target
+                ? `(target: ${nextIntention.target.x},${nextIntention.target.y})`
+                : '',
+            missionState.active ? `[MISSION: ${missionState.description}]` : '',
+        );
         current = nextIntention;
     }
 }

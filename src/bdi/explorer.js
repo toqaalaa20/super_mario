@@ -107,6 +107,11 @@ export function explorePath(me) {
     const path = aStar(me, target);
 
     if (path.length === 0) {
+        // Target is unreachable right now (e.g. blocked by another agent or a
+        // one-way tile). Mark it visited so the frontier doesn't keep re-picking
+        // the same unreachable tile, which caused the agent to rotate in place.
+        markVisited(target.x, target.y);
+
         const dirs = [
             [0, 1, 'up'], [0, -1, 'down'], [-1, 0, 'left'], [1, 0, 'right']
         ];
