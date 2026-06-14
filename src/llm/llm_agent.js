@@ -1,4 +1,7 @@
 import 'dotenv/config';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import OpenAI from 'openai';
 import { DjsConnect } from '@unitn-asa/deliveroo-js-sdk';
 import { beliefs, updateFromSensing, setMap } from '../bdi/beliefs.js';
@@ -6,6 +9,13 @@ import { reviseIntention, getCurrentIntention, INTENTION, setMissionState, missi
 import { executePlan } from '../bdi/executor.js';
 import { explorePath } from '../bdi/explorer.js';
 import { manhattan } from '../bdi/utils.js';
+import { buildPickupAndDeliverProblem, buildMeetupProblem, buildHandoffDropProblem } from '../bdi/pddl/level3ProblemGenerator.js';
+import { solve } from '../bdi/pddl/plannerClient.js';
+import { translatePlan, translateMeetupPlan, extractHandoffDrop } from '../bdi/pddl/planTranslator.js';
+
+const __llmDirname = path.dirname(fileURLToPath(import.meta.url));
+const DOMAIN_PDDL = fs.readFileSync(path.join(__llmDirname, '../bdi/pddl/domain.pddl'), 'utf-8');
+const DOMAIN_HANDOFF_PDDL = fs.readFileSync(path.join(__llmDirname, '../bdi/pddl/domain_handoff.pddl'), 'utf-8');
 
 // ─── LLM client ───────────────────────────────────────────────────────────────
 
@@ -231,6 +241,13 @@ async function followPath(path, label) {
 async function getMyPosition() {
     if (me.x === null) return 'Error: position not available yet.';
     return JSON.stringify({ x: me.x, y: me.y, score: me.score, name: me.name });
+}
+
+function getCarriedParcels() {
+    return JSON.stringify(beliefs.carrying.map(id => ({
+        id,
+        reward: beliefs.carriedParcels.get(id)?.reward ?? null,
+    })));
 }
 
 async function moveTo(args) {
@@ -513,10 +530,96 @@ async function clearMissionOnBDI() {
     return 'Mission cleared on BDI agent.';
 }
 
+async function solvePDDL(inputStr) {
+    let parsed;
+    try { parsed = JSON.parse(inputStr); } catch { return 'Error: input must be valid JSON.'; }
+
+    const { type, params = {} } = parsed;
+
+    // ── PARCEL_HANDOFF: two-agent joint drop-point optimisation ─────────────
+    // Uses a separate domain (domain_handoff.pddl) and returns a drop point,
+    // not a step list — handled before the shared single-agent flow below.
+    if (type === 'PARCEL_HANDOFF') {
+        const { parcelId } = params;
+        if (!parcelId) return 'Error: PARCEL_HANDOFF requires parcelId.';
+        if (!beliefs.carrying.includes(parcelId)) {
+            return `Error: not currently carrying parcel ${parcelId} — call pickup() first.`;
+        }
+        if (!lastBdiPosition) {
+            return 'Error: BDI position not yet known — call get_bdi_position() and retry. If it stays unknown, fall back: check get_delivery_tiles() and, if your current tile is NOT a delivery tile, putdown() here.';
+        }
+        try {
+            const built = buildHandoffDropProblem(parcelId, lastBdiPosition);
+            if (!built) return 'Error: could not build handoff problem (no non-delivery tiles near you or no delivery tiles available).';
+
+            console.log('[PDDL-HANDOFF] submitting to solver…');
+            const result = await solve(DOMAIN_HANDOFF_PDDL, built.problem);
+            if (!result) return 'Error: PDDL solver timed out or returned null.';
+            if (!result.plan?.length) return 'No plan found for handoff (problem may be unsolvable given current world state).';
+
+            const drop = extractHandoffDrop(result.plan, built);
+            if (!drop) return 'Error: solver plan did not include a handoff-drop action.';
+            console.log(`[PDDL-HANDOFF] resolved drop point (${drop.x},${drop.y})`);
+            return JSON.stringify({ dropX: drop.x, dropY: drop.y });
+        } catch (err) {
+            console.warn('[PDDL-HANDOFF] error:', err.message);
+            return `Error: ${err.message}`;
+        }
+    }
+
+    try {
+        let built = null;
+        let translator;
+
+        if (type === 'PICKUP_AND_DELIVER') {
+            const { parcelId, x, y } = params;
+            if (!parcelId || x == null || y == null)
+                return 'Error: PICKUP_AND_DELIVER requires parcelId, x, y.';
+            console.log(`[PDDL] LLM calling solver for PICKUP_AND_DELIVER — parcel=${parcelId} drop=(${x},${y})`);
+            built = buildPickupAndDeliverProblem(parcelId, x, y);
+            translator = (actions, maps) => translatePlan(actions, maps);
+        } else if (type === 'COORDINATE_MEETUP') {
+            const { x, y, radius = 3 } = params;
+            if (x == null || y == null) return 'Error: COORDINATE_MEETUP requires x, y.';
+            console.log(`[PDDL] LLM calling solver for COORDINATE_MEETUP — target=(${x},${y}) radius=${radius}`);
+            built = buildMeetupProblem(x, y, radius);
+            if (built?.meetupTile) {
+                const tile = built.meetupTile;
+                translator = (actions, maps) => translateMeetupPlan(actions, maps, tile);
+            } else {
+                translator = (actions, maps) => translatePlan(actions, maps);
+            }
+        } else {
+            return `Error: unsupported type "${type}". Use PICKUP_AND_DELIVER, COORDINATE_MEETUP, or PARCEL_HANDOFF.`;
+        }
+
+        if (!built) return 'Error: could not build PDDL problem (no delivery tiles or unreachable meetup tile?).';
+
+        console.log('[PDDL] submitting to solver…');
+        const result = await solve(DOMAIN_PDDL, built.problem);
+        if (!result) return 'Error: PDDL solver timed out or returned null.';
+        if (!result.plan?.length) return 'No plan found (problem may be unsolvable given current world state).';
+
+        const intentions = translator(result.plan, built);
+        console.log(`[PDDL] plan translated to ${intentions.length} step(s)`);
+        return JSON.stringify({
+            steps: intentions.map(i => ({
+                action: i.type,
+                target: i.target,
+            })),
+        });
+    } catch (err) {
+        console.warn('[PDDL] solvePDDL error:', err.message);
+        return `Error: ${err.message}`;
+    }
+}
+
+
 const TOOLS = {
     calculate,
     manhattan_distance: manhattanDistance,
     get_my_position: getMyPosition,
+    get_carried_parcels: getCarriedParcels,
     move_to: moveTo,
     explore,
     pickup,
@@ -530,6 +633,7 @@ const TOOLS = {
     clear_mission_on_bdi: clearMissionOnBDI,
     get_bdi_position: getBdiPosition,
     wait_for_chat_signal: waitForChatSignal,
+    solve_pddl: solvePDDL,
 };
 
 // ─── System prompt ─────────────────────────────────────────────────────────────
@@ -543,6 +647,7 @@ Available tools:
 - calculate(expression): evaluate basic arithmetic expressions (+ - * / only — NO function calls like abs() or manhattan_distance(), these are NOT valid inside calculate)
 - manhattan_distance(x1=A,y1=B,x2=C,y2=D): compute the Manhattan distance |x1-x2| + |y1-y2| between two points. This is its own Action — call it directly as "Action: manhattan_distance", never inside calculate.
 - get_my_position(): get your current (x, y) and score
+- get_carried_parcels(): list parcels you are CURRENTLY CARRYING, e.g. [{"id":"p123","reward":45}]. Empty array if carrying nothing. ALWAYS check this first for PARCEL_HANDOFF — if non-empty, you already have a parcel to hand off and must NOT pick up or look for another one.
 - move_to(x=N,y=M): navigate to a target tile using the BDI A* planner. Input example: x=14, y=12
 - explore(): use the BDI explorer + A* planner to move toward an unexplored frontier
 - pickup(): pick up parcels at your current position
@@ -568,6 +673,10 @@ Available tools:
 - clear_mission_on_bdi(): cancel any active mission on the BDI agent
 - get_bdi_position(): get BDI agent's last known (x,y) position — use to check if BDI arrived at meetup point
 - wait_for_chat_signal(keyword): block until that keyword appears in game chat (e.g. "green"); times out after 2 minutes
+- solve_pddl(json): call the external PDDL planner.
+  Input: { "type": "PICKUP_AND_DELIVER"|"COORDINATE_MEETUP"|"PARCEL_HANDOFF", "params": {...} }
+  - "PICKUP_AND_DELIVER" / "COORDINATE_MEETUP": params same as send_mission_to_bdi. Returns { "steps": [{ "action": "pickup"|"deliver"|"meetup", "target": {...} }, ...] } — an optimized action sequence. Use this BEFORE sending instructions to the BDI to find the optimal path/order (e.g. which delivery tile to use, whether to pick up parcels en route to a meetup). Then use the returned steps to inform your send_mission_to_bdi calls.
+  - "PARCEL_HANDOFF": params = { "parcelId": "<id>" }. Requires you to be CARRYING the parcel already (call pickup() first). Jointly optimizes where you should drop the parcel by considering BOTH your current position AND the BDI's last known position (get_bdi_position()), minimizing your walk to the drop point plus the BDI's walk to retrieve and deliver it. Returns { "dropX": N, "dropY": M } — always a non-delivery tile. Use this BEFORE putdown() in the PARCEL_HANDOFF recipe below.
 
 Movement rules:
 - Use move_to for navigating to specific coordinates.
@@ -587,9 +696,29 @@ Mission decision rules:
   * "Stop for N seconds": call wait_for_chat_signal("green") — the green signal fires automatically after N seconds.
 - For Level 2 persistent missions (e.g. "deliver stacks of 3 to double reward"): call send_mission_to_bdi() to instruct the BDI agent, then give Final Answer immediately.
 - For Level 3 coordination missions:
-  * COORDINATE_MEETUP: (1) call send_mission_to_bdi with type COORDINATE_MEETUP so the BDI starts moving there; (2) call move_to to navigate yourself to the same (x,y); (3) poll get_bdi_position() and get_my_position(), use manhattan_distance(x1=...,y1=...,x2=...,y2=...) for each agent vs the target, and confirm BOTH are within radius 3 of the target; (4) once confirmed, call clear_mission_on_bdi() so the BDI resumes normal behaviour, then give Final Answer. The BDI freezes in place once it enters the radius and will NOT resume until clear_mission_on_bdi() is called — do not delay this step.
+  * COORDINATE_MEETUP:
+    (1) MANDATORY — call solve_pddl({"type":"COORDINATE_MEETUP","params":{"x":N,"y":M,"radius":3}}). The returned steps are YOUR optimal path to the meetup (not the BDI's) and may include en-route parcel pickups that earn points on the way — do NOT discard them.
+    (2) call send_mission_to_bdi with type COORDINATE_MEETUP so the BDI starts moving there in parallel.
+    (3) Execute the PDDL steps yourself in order without skipping or questioning them:
+        - "pickup" step → move_to the parcel's (x,y), then pickup().
+        - "deliver" step → move_to the delivery tile's (x,y), then putdown(). A deliver step with no preceding pickup step is normal — it means you are already carrying parcels; just go deliver them.
+        - "meetup" step → move_to the step's target (x,y). This tile may differ from the original mission coordinates because the PDDL resolves the nearest walkable tile within the radius — use the PDDL target as-is, do NOT substitute the original (N,M).
+        Never override or ignore a PDDL step because it looks unexpected.
+    (4) poll get_bdi_position() and get_my_position(), use manhattan_distance to confirm BOTH agents are within radius 3 of (N,M).
+    (5) call clear_mission_on_bdi() then give Final Answer. The BDI freezes once it enters the radius and will NOT resume until clear_mission_on_bdi() is called — do not delay this step.
   * WAIT_FOR_SIGNAL (red-light/green-light): BOTH agents must be on an odd-numbered row (y % 2 !== 0) and frozen before the green light. Steps: (1) call send_mission_to_bdi with type WAIT_FOR_SIGNAL so BDI starts moving to an odd row; (2) call get_my_position() to check your own y — if y is even, call move_to(x=<your_x>, y=<your_y+1>) to step onto the next odd row; (3) call wait_for_chat_signal("green") to freeze yourself until the signal arrives; (4) give Final Answer after the signal is received.
-  * PARCEL_HANDOFF (you pick up, BDI delivers): (1) call pickup() on the target parcel; (2) call move_to to navigate to a convenient intermediate position that is NOT a delivery tile (check with get_delivery_tiles() — putting the parcel down on a delivery tile auto-delivers it immediately, so there would be nothing left for the BDI to hand off); (3) call putdown() to drop the parcel; (4) call get_my_position() to get the exact drop coordinates; (5) call send_mission_to_bdi({ type: "PICKUP_AND_DELIVER", params: { parcelId: "<id>", x: <drop_x>, y: <drop_y> } }) — BDI will navigate to the drop point, pick up the parcel, and deliver it autonomously; (6) give Final Answer immediately.
+  * PARCEL_HANDOFF (you pick up, BDI delivers, +200pts handoff bonus):
+    (0) call get_carried_parcels() FIRST.
+            - If it returns one or more parcels: you already have a target — use the first parcel's "id" as <id> and skip directly to step (2). Do NOT call pickup(), do NOT call get_visible_parcels()/explore() to look for another parcel.
+            - If it returns an empty array: find a target parcel — use get_visible_parcels()/explore() until you see a parcel with carriedBy=null. Unlike normal operation, claimedByPartner=true is FINE for this mission — the parcel ends up with the BDI either way, so do not avoid or wait on claimed parcels. Pick the closest carriedBy=null parcel, move_to its (x,y), then call pickup() on it. Then proceed to step (2) with the picked-up parcel's <id>.    (1) call pickup() on it.
+    (2) MANDATORY — call solve_pddl({"type":"PARCEL_HANDOFF","params":{"parcelId":"<id>"}}) to compute the optimal drop point. This jointly considers your current position AND the BDI's last known position, minimizing your walk to the drop point plus the BDI's walk to retrieve and deliver it. Returns {"dropX":N,"dropY":M} — always a non-delivery tile, so you don't need to check get_delivery_tiles() yourself.
+        - If it errors ONLY because the BDI's position is unknown: call get_bdi_position() once, then retry solve_pddl ONE time.
+        - If solve_pddl still errors or returns "No plan found" after that single retry: STOP — do not call calculate, get_all_walkable_tiles, or compute a midpoint yourself. Set dropX,dropY to your CURRENT position (call get_my_position() if needed) and go straight to step 4. Your current tile cannot be a delivery tile (you are standing where you just picked the parcel up — putdown there would have auto-delivered it), so dropping here is always valid.
+    (3) If (dropX,dropY) differs from your current position, call move_to(x=dropX, y=dropY). If it's the fallback (your current position), skip this step.
+    (4) call putdown() to drop the parcel.
+    (5) call get_my_position() to get the exact drop coordinates.
+    (6) call send_mission_to_bdi({ type: "PICKUP_AND_DELIVER", params: { parcelId: "<id>", x: <drop_x>, y: <drop_y> } }) — BDI will navigate to the drop point, pick up the parcel, and deliver it autonomously.
+    (7) give Final Answer immediately.
 - After completing a mission, your Final Answer text is automatically broadcast to the game chat — do NOT call send_chat_message to report the result (that would double-send). Use send_chat_message only for mid-mission status messages.
 
 STRICT OUTPUT FORMAT — use exactly one format per message:
@@ -617,8 +746,22 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 function extractAction(text) {
     const a = text.match(/^Action:\s*(.+)$/im);
     if (!a) return null;
+    let action = a[1].trim();
+
     const i = text.match(/^Action Input:\s*([\s\S]*?)(?=\n(?:Thought|Action|Final Answer)|$)/im);
-    return { action: a[1].trim(), actionInput: i ? i[1].trim() : '' };
+    let actionInput = i ? i[1].trim() : '';
+
+    // Tolerate function-call syntax, e.g. "Action: get_carried_parcels()" or
+    // "Action: move_to(x=13, y=1)" — strip the trailing (...) from the action
+    // name. If no separate "Action Input:" line was given, use the
+    // parenthesized content as the input.
+    const callMatch = action.match(/^([A-Za-z0-9_]+)\s*\((.*)\)\s*$/s);
+    if (callMatch) {
+        action = callMatch[1];
+        if (!actionInput && callMatch[2].trim()) actionInput = callMatch[2].trim();
+    }
+
+    return { action, actionInput };
 }
 
 function extractFinalAnswer(text) {

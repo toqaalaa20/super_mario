@@ -1,12 +1,6 @@
 // intentions.js
-import fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
 import { beliefs, freeParcels, deliveryTiles, totalCarriedReward } from './beliefs.js';
 import { manhattan } from './utils.js';
-import { buildProblem } from './pddl/problemGenerator.js';
-import { solve } from './pddl/plannerClient.js';
-import { translatePlan } from './pddl/planTranslator.js';
 
 export const INTENTION = {
     PICKUP: 'pickup',
@@ -19,103 +13,32 @@ export const INTENTION = {
 let current = null;
 let pickupAndDeliverStuckTicks = 0;
 
-// ─── PDDL-based pickup/delivery sequencing ─────────────────────────────────
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const DOMAIN_PDDL = fs.readFileSync(path.join(__dirname, 'pddl', 'domain.pddl'), 'utf-8');
-const PDDL_ENABLED = process.env.PDDL_ENABLED !== 'false';
-
-let plannedQueue = [];
-let plannerStatus = 'idle'; // 'idle' | 'pending'
-let lastPlannedSignature = null;
-
-/** Cheap fingerprint of the world state, used to decide when to replan */
-function computeSignature() {
-    const carrying = [...beliefs.carrying].sort().join(',');
-    const free = freeParcels()
-        .filter(p => p.reward > 5 && parcelAllowed(p))
-        .map(p => p.id).sort().join(',');
-    return `${missionState.type ?? 'none'}|${carrying}|${free}`;
-}
-
-/** True if the head of the planned queue still refers to something achievable */
-function queueHeadValid() {
-    const head = plannedQueue[0];
-    if (!head) return false;
-    if (head.type === INTENTION.PICKUP) {
-        return freeParcels().some(p => p.id === head.target.id);
-    }
-    if (head.type === INTENTION.DELIVER) {
-        return filterAvoidedTiles(deliveryTiles())
-            .some(t => t.x === head.target.x && t.y === head.target.y);
-    }
-    return false;
-}
-
-/** Fire-and-forget: ask the external PDDL solver for an optimized pickup/delivery sequence */
-async function triggerReplan(signature) {
-    plannerStatus = 'pending';
-    try {
-        const built = buildProblem();
-        if (built) {
-            const result = await solve(DOMAIN_PDDL, built.problem);
-            if (result?.plan?.length) {
-                const translated = translatePlan(result.plan, built);
-                if (translated.length) {
-                    plannedQueue = translated;
-                    console.log('[PDDL] Plan received:', translated.map(i =>
-                        `${i.type}(${i.target?.id ?? `${i.target?.x},${i.target?.y}`})`).join(' -> '));
-                }
-            }
-        }
-    } catch (err) {
-        console.warn('[PDDL] replan failed:', err.message);
-    } finally {
-        lastPlannedSignature = signature;
-        plannerStatus = 'idle';
-    }
-}
-
 export function getCurrentIntention() { return current; }
 
-// ─── Mission state (written by llm_agent.js) ──────────────────────────────────
+// ─── Mission state (written by llm_agent.js / bdi/index.js) ──────────────────
 export const missionState = {
     active: false,
-    type: null,    // 'STACK_SIZE' | 'PREFERRED_DELIVERY' | 'AVOID_TILE' | 'SCORE_FILTER' | 'MOVE_TO_POSITION'
+    type: null,
     params: {},
     description: '',
 };
 
 export function setMissionState(state) {
     Object.assign(missionState, state);
-    // Don't let a stuck-tick count from a previous/cancelled PICKUP_AND_DELIVER
-    // mission carry over into a later one.
     if (missionState.type !== 'PICKUP_AND_DELIVER') {
         pickupAndDeliverStuckTicks = 0;
     }
     console.log('[INTENTION] Mission state updated:', missionState);
 }
 
-// Reset module-level state — used by tests to isolate cases
 export function resetState() {
     current = null;
     pickupAndDeliverStuckTicks = 0;
-    plannedQueue = [];
-    plannerStatus = 'idle';
-    lastPlannedSignature = null;
     Object.assign(missionState, { active: false, type: null, params: {}, description: '' });
 }
 
 // ─── Mission-aware helpers ─────────────────────────────────────────────────────
 
-/** True if any other known agent is within radius of (x,y) */
-function partnerNearby(x, y, radius) {
-    for (const a of beliefs.agents.values()) {
-        if (manhattan(a, { x, y }) <= radius) return true;
-    }
-    return false;
-}
-
-/** True if (x,y) is the tile an active AVOID_TILE mission says to avoid */
 function isAvoidedTile(x, y) {
     if (missionState.active && missionState.type === 'AVOID_TILE') {
         return missionState.params.x === x && missionState.params.y === y;
@@ -123,7 +46,6 @@ function isAvoidedTile(x, y) {
     return false;
 }
 
-/** Apply SCORE_FILTER: skip parcels whose reward exceeds the cap */
 export function parcelAllowed(parcel) {
     if (missionState.active && missionState.type === 'SCORE_FILTER') {
         if (parcel.reward > (missionState.params.maxReward ?? Infinity)) return false;
@@ -132,7 +54,6 @@ export function parcelAllowed(parcel) {
     return true;
 }
 
-/** Filter out delivery tiles that fall on an avoided tile */
 export function filterAvoidedTiles(tiles) {
     if (missionState.active && missionState.type === 'AVOID_TILE') {
         return tiles.filter(t => !isAvoidedTile(t.x, t.y));
@@ -140,7 +61,6 @@ export function filterAvoidedTiles(tiles) {
     return tiles;
 }
 
-/** Apply PREFERRED_DELIVERY: sort preferred tiles first */
 export function sortDeliveryTiles(tiles, me) {
     if (missionState.active && missionState.type === 'PREFERRED_DELIVERY') {
         const preferred = missionState.params.tiles ?? [];
@@ -154,10 +74,6 @@ export function sortDeliveryTiles(tiles, me) {
     return tiles.sort((a, b) => manhattan(me, a) - manhattan(me, b));
 }
 
-/**
- * Apply STACK_SIZE: only deliver when carrying exactly `size` parcels.
- * Returns true if we should deliver now, false if we should keep collecting.
- */
 function shouldDeliver(me, nearestDelivery) {
     if (missionState.active && missionState.type === 'STACK_SIZE') {
         const required = missionState.params.size ?? 1;
@@ -165,7 +81,7 @@ function shouldDeliver(me, nearestDelivery) {
         console.log(`[STACK_SIZE] carrying=${beliefs.carrying.length}/${required} → ${ready ? 'DELIVER' : 'HOLD'}`);
         return ready;
     }
-    return true; // default: deliver whenever it's profitable
+    return true;
 }
 
 // ─── Main intention revision ───────────────────────────────────────────────────
@@ -174,8 +90,6 @@ export function reviseIntention() {
     const me = beliefs.me;
     if (!me) return;
 
-    // Remove filtered parcels from beliefs so freeParcels() callers all see the same set
-    // and the agent explores instead of idling near disallowed parcels.
     if (missionState.active && (missionState.type === 'SCORE_FILTER' || missionState.type === 'AVOID_TILE')) {
         for (const [id, p] of beliefs.parcels) {
             if (!parcelAllowed(p)) {
@@ -200,32 +114,27 @@ export function reviseIntention() {
         if (missionState.type === 'COORDINATE_MEETUP') {
             const { x, y, radius = 3 } = missionState.params;
             if (manhattan(me, { x, y }) <= radius) {
-                // Within radius — freeze and wait for the LLM to confirm both agents
-                // have met and call clear_mission_on_bdi(). Don't auto-clear here:
-                // that would let the BDI wander off again before the LLM verifies.
                 const changed = !current || current.type !== INTENTION.WAIT;
                 if (changed) {
                     console.log(`[MISSION] COORDINATE_MEETUP: reached (${x},${y}) within radius ${radius} — waiting for LLM confirmation`);
                     current = { type: INTENTION.WAIT, target: { x, y } };
                 }
-            } else {
-                const changed = !current || current.type !== INTENTION.MEETUP
-                    || current.target?.x !== x || current.target?.y !== y;
-                if (changed) current = { type: INTENTION.MEETUP, target: { x, y, radius } };
+                return;
             }
+            const changed = !current || current.type !== INTENTION.MEETUP
+                || current.target?.x !== x || current.target?.y !== y;
+            if (changed) current = { type: INTENTION.MEETUP, target: { x, y, radius } };
             return;
         }
 
         if (missionState.type === 'PICKUP_AND_DELIVER') {
             const { parcelId, x, y } = missionState.params;
             if (beliefs.carrying.includes(parcelId)) {
-                // Holding the handoff parcel — clear mission, fall through to normal DELIVER
+                console.log(`[PICKUP_AND_DELIVER] parcel ${parcelId} picked up — clearing mission, falling through to deliver`);
                 setMissionState({ active: false, type: null, params: {}, description: '' });
                 pickupAndDeliverStuckTicks = 0;
+                // fall through to greedy delivery below
             } else if (!beliefs.parcels.has(parcelId) && manhattan(me, { x, y }) === 0) {
-                // At the drop point but the parcel isn't there (e.g. it was put down
-                // on a delivery tile and auto-delivered already). Give up after a few
-                // ticks instead of waiting forever for a parcel that's never coming.
                 pickupAndDeliverStuckTicks++;
                 if (pickupAndDeliverStuckTicks >= 3) {
                     console.log(`[PICKUP_AND_DELIVER] parcel ${parcelId} not found at (${x},${y}) — giving up on handoff`);
@@ -236,11 +145,9 @@ export function reviseIntention() {
                     return;
                 }
             } else {
-                // Not yet carrying — navigate to drop point and pick it up
                 pickupAndDeliverStuckTicks = 0;
                 const parcel = beliefs.parcels.get(parcelId) ?? { id: parcelId, x, y };
-                const changed = !current || current.type !== INTENTION.PICKUP
-                    || current.target?.id !== parcelId;
+                const changed = !current || current.type !== INTENTION.PICKUP || current.target?.id !== parcelId;
                 if (changed) current = { type: INTENTION.PICKUP, target: parcel };
                 return;
             }
@@ -259,7 +166,6 @@ export function reviseIntention() {
                 if (changed) current = { type: INTENTION.MEETUP, target: { x: me.x, y: ty, radius: 0 } };
                 return;
             }
-            // frozen === false: green light received — clear mission and fall through
             setMissionState({ active: false, type: null, params: {}, description: '' });
         }
 
@@ -277,38 +183,10 @@ export function reviseIntention() {
         }
     }
 
+    // ── 1. Carrying parcels ──────────────────────────────────────────────────
     let nextIntention = null;
 
-    // ── PDDL-planned sequence ─────────────────────────────────────────────────
-    // Pop steps of the previously-solved plan as they complete.
-    while (plannedQueue.length) {
-        const head = plannedQueue[0];
-        if (head.type === INTENTION.PICKUP && beliefs.carrying.includes(head.target.id)) {
-            plannedQueue.shift();
-            continue;
-        }
-        if (head.type === INTENTION.DELIVER && beliefs.carrying.length === 0) {
-            plannedQueue.shift();
-            continue;
-        }
-        break;
-    }
-
-    if (plannedQueue.length && !queueHeadValid()) {
-        plannedQueue = [];
-    }
-
-    if (plannedQueue.length) {
-        nextIntention = plannedQueue[0];
-    } else {
-        const signature = computeSignature();
-        if (PDDL_ENABLED && plannerStatus === 'idle' && signature !== lastPlannedSignature) {
-            triggerReplan(signature);
-        }
-    }
-
-    // ── 1. Carrying parcels ──────────────────────────────────────────────────
-    if (!nextIntention && beliefs.carrying.length > 0) {
+    if (beliefs.carrying.length > 0) {
         const allDelivery = filterAvoidedTiles(deliveryTiles());
         const sortedDelivery = sortDeliveryTiles(allDelivery, me);
         const nearestDelivery = sortedDelivery[0];
@@ -321,8 +199,6 @@ export function reviseIntention() {
                 ? carried / (manhattan(me, nearestDelivery) + 1)
                 : 0;
 
-            // Consider diverting to pick up more parcels (only if not in STACK_SIZE mode
-            // or we haven't reached the required stack yet)
             const canDivert = !missionState.active || missionState.type !== 'STACK_SIZE'
                 || beliefs.carrying.length < (missionState.params.size ?? 1);
 
@@ -353,9 +229,6 @@ export function reviseIntention() {
                 nextIntention = { type: INTENTION.DELIVER, target: nearestDelivery };
             }
         } else {
-            // STACK_SIZE: not enough parcels yet — go collect more first.
-            // Don't fall back to delivering an incomplete stack; explore until
-            // enough parcels are found so deliveries always happen in exact batches.
             const candidates = freeParcels()
                 .filter(parcelAllowed)
                 .sort((a, b) => {

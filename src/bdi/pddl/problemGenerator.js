@@ -20,6 +20,7 @@ const MAX_DELIVERY_TILES = 3;
 export function buildProblem() {
     const me = beliefs.me;
     if (!me) return null;
+    const meSnapped = { x: Math.round(me.x), y: Math.round(me.y) };
 
     const freeCandidates = freeParcels()
         .filter(p => p.reward > 5 && parcelAllowed(p))
@@ -39,8 +40,8 @@ export function buildProblem() {
     if (deliveryCandidates.length === 0) return null;
 
     // ── Build locations ──────────────────────────────────────────────────
-    const locations = [{ name: 'loc-agent', x: me.x, y: me.y }];
-    const locationMap = { 'loc-agent': { x: me.x, y: me.y } };
+    const locations = [{ name: 'loc-agent', x: meSnapped.x, y: meSnapped.y }];
+    const locationMap = { 'loc-agent': { x: meSnapped.x, y: meSnapped.y } };
 
     for (const p of freeCandidates) {
         const name = `loc-p${p.id}`;
