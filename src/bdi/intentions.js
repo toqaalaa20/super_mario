@@ -156,14 +156,15 @@ export function reviseIntention() {
         if (missionState.type === 'WAIT_FOR_SIGNAL') {
             const frozen = missionState.params.frozen !== false;
             if (frozen) {
-                if (me.y % 2 !== 0) {
-                    current = { type: INTENTION.WAIT, target: null };
+                const target = missionState.params.target;
+                if (target && manhattan(me, target) > 0) {
+                    // Navigate to the LLM-specified position before freezing.
+                    const changed = !current || current.type !== INTENTION.MEETUP
+                        || current.target?.x !== target.x || current.target?.y !== target.y;
+                    if (changed) current = { type: INTENTION.MEETUP, target: { ...target, radius: 0 } };
                     return;
                 }
-                const ty = me.y + 1;
-                const changed = !current || current.type !== INTENTION.MEETUP
-                    || current.target?.x !== me.x || current.target?.y !== ty;
-                if (changed) current = { type: INTENTION.MEETUP, target: { x: me.x, y: ty, radius: 0 } };
+                current = { type: INTENTION.WAIT, target: null };
                 return;
             }
             setMissionState({ active: false, type: null, params: {}, description: '' });

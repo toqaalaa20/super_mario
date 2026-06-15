@@ -652,7 +652,8 @@ Available tools:
     { "type": "SCORE_FILTER", "params": { "maxReward": 10 }, "description": "Only deliver parcels reward <= 10" }
   Level 3 types — "COORDINATE_MEETUP"|"WAIT_FOR_SIGNAL"|"PICKUP_AND_DELIVER":
     { "type": "COORDINATE_MEETUP", "params": { "x": N, "y": M, "radius": 3 }, "description": "Both agents move to within 3 tiles of (N,M) and wait for each other" }
-    { "type": "WAIT_FOR_SIGNAL", "params": {}, "description": "BDI moves to an odd row and freezes until green-light chat message" }
+    { "type": "WAIT_FOR_SIGNAL", "params": {}, "description": "BDI freezes in place and waits for green-light signal" }
+    { "type": "WAIT_FOR_SIGNAL", "params": { "target": { "x": N, "y": M } }, "description": "BDI navigates to (N,M) then freezes and waits for green-light signal" }
     { "type": "PICKUP_AND_DELIVER", "params": { "parcelId": "<id>", "x": N, "y": M }, "description": "BDI picks up parcel <id> from (N,M) and delivers it" }
 - clear_mission_on_bdi(): cancel any active mission on the BDI agent
 - get_bdi_position(): get BDI agent's last known (x,y) position — use to check if BDI arrived at meetup point
@@ -667,7 +668,10 @@ Movement rules:
 - Use explore when you want the agent to keep expanding into unexplored map tiles.
 
 Mission decision rules:
-- BEFORE doing anything else — before classifying the mission as Level 1/2/3, before calling move_to/explore/any tool — check whether the mission is profitable. This gate applies to EVERY mission, including ones phrased as plain navigation commands like "Go to...", "Move to...", "Head to...", "Navigate to...", "Explore...".
+- STOP/FREEZE EXCEPTION — check this FIRST: If the mission is a command to stop both agents (e.g. "stop", "all agents stop", "halt", "freeze", "stop and wait for green light", "wait for green light", "red light"):
+  * If the mission states a NEGATIVE point value, decline immediately: "Mission declined: not profitable." Do NOT execute WAIT_FOR_SIGNAL.
+  * Otherwise (no point value stated, or a positive point value), accept and treat as WAIT_FOR_SIGNAL — the absence of an explicit objective does NOT disqualify stop/freeze commands. Skip directly to the WAIT_FOR_SIGNAL steps below.
+- BEFORE doing anything else — before classifying the mission as Level 1/2/3, before calling move_to/explore/any tool — check whether the mission is profitable. This gate applies to EVERY mission except stop/freeze commands (covered above), including ones phrased as plain navigation commands like "Go to...", "Move to...", "Head to...", "Navigate to...", "Explore...".
   * Extract any point value mentioned in the mission. Point values can be written in many formats:
     "-5pts", "-5 pts", "-5 pts.", "-5 points", "minus 5 points", "lose 5pts", "costs 5pts", etc.
   * If the point value is NEGATIVE (less than zero), ALWAYS decline regardless of formatting.
@@ -691,7 +695,13 @@ Mission decision rules:
         Never override or ignore a PDDL step because it looks unexpected.
     (4) poll get_bdi_position() and get_my_position(), use manhattan_distance to confirm BOTH agents are within radius 3 of (N,M).
     (5) call clear_mission_on_bdi() then give Final Answer. The BDI freezes once it enters the radius and will NOT resume until clear_mission_on_bdi() is called — do not delay this step.
-  * WAIT_FOR_SIGNAL (red-light/green-light): BOTH agents must be on an odd-numbered row (y % 2 !== 0) and frozen before the green light. Steps: (1) call send_mission_to_bdi with type WAIT_FOR_SIGNAL so BDI starts moving to an odd row; (2) call get_my_position() to check your own y — if y is even, call move_to(x=<your_x>, y=<your_y+1>) to step onto the next odd row; (3) call wait_for_chat_signal("green") to freeze yourself until the signal arrives; (4) give Final Answer after the signal is received.
+  * WAIT_FOR_SIGNAL (stop and wait for green-light signal):
+    (1) MANDATORY FIRST — call send_mission_to_bdi to freeze the BDI immediately:
+        - If the mission requires the BDI to stop at a specific position (e.g. "delivery tile", "tile (3,4)", "odd row"): compute the BDI's target first (use get_bdi_position(), get_delivery_tiles(), get_all_walkable_tiles() as needed), then call send_mission_to_bdi({ type: "WAIT_FOR_SIGNAL", params: { target: { x: N, y: M } }, description: "..." }). The BDI will navigate to that position and freeze there atomically.
+        - Otherwise (no specific position): call send_mission_to_bdi({ type: "WAIT_FOR_SIGNAL", params: {}, description: "..." }). The BDI freezes wherever it currently is.
+    (2) If the mission requires you to stop at a specific position, call move_to your own target. Otherwise stay put.
+    (3) call wait_for_chat_signal("green") to freeze yourself until the signal arrives.
+    (4) give Final Answer after the signal is received.
   * PARCEL_HANDOFF (you pick up, BDI delivers, +200pts handoff bonus):
     (0) call get_carried_parcels() FIRST.
             - If it returns one or more parcels: you already have a target — use the first parcel's "id" as <id> and skip directly to step (2). Do NOT call pickup(), do NOT call get_visible_parcels()/explore() to look for another parcel.
@@ -922,19 +932,6 @@ socket.onMsg(async (id, name, msg) => {
     if (adminName && name !== adminName) {
         console.log(`[LLM] Ignoring mission from non-admin "${name}".`);
         return;
-    }
-
-    // Fast-path: immediately freeze this agent's sensing loop for stop-and-wait commands
-    // so normal pickup/delivery stops right away, before the LLM API round-trip completes.
-    // The full ReAct loop still runs to send MISSION to BDI and call wait_for_chat_signal.
-    if (!missionRunning && /(\bstop\b.*\bwait\b|\bwait.*for.*green\b|\bfreeze\b|\bred.?light\b)/i.test(msg)) {
-        setMissionState({
-            active: true,
-            type: 'WAIT_FOR_SIGNAL',
-            params: { frozen: true },
-            description: 'Waiting for green light',
-        });
-        console.log('[LLM] Stop command detected — pre-freezing local sensing loop');
     }
 
     missionQueue.push({ name, msg });
