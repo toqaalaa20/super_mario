@@ -81,6 +81,12 @@ function shouldDeliver(me, nearestDelivery) {
         console.log(`[STACK_SIZE] carrying=${beliefs.carrying.length}/${required} → ${ready ? 'DELIVER' : 'HOLD'}`);
         return ready;
     }
+    if (missionState.active && missionState.type === 'AVOID_STACK_SIZE') {
+        const avoided = missionState.params.size ?? 0;
+        const ready = beliefs.carrying.length !== avoided;
+        console.log(`[AVOID_STACK_SIZE] carrying=${beliefs.carrying.length}, avoided=${avoided} → ${ready ? 'DELIVER' : 'HOLD (keep picking up)'}`);
+        return ready;
+    }
     return true;
 }
 

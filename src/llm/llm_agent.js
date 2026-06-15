@@ -661,8 +661,9 @@ Available tools:
   The JSON must be: { "type": "<TYPE>", "params": {...}, "description": "..." }
   Navigation type — "MOVE_TO_POSITION" (send this to BDI when you want the BDI agent to navigate somewhere):
     { "type": "MOVE_TO_POSITION", "params": { "x": 4, "y": 7, "reward": 10 }, "description": "BDI moves to (4,7) for +10pts using A* pathfinding" }
-  Level 2 types — "STACK_SIZE"|"PREFERRED_DELIVERY"|"AVOID_TILE"|"SCORE_FILTER":
+  Level 2 types — "STACK_SIZE"|"AVOID_STACK_SIZE"|"PREFERRED_DELIVERY"|"AVOID_TILE"|"SCORE_FILTER":
     { "type": "STACK_SIZE", "params": { "size": 3 }, "description": "Deliver exactly 3 parcels at a time" }
+    { "type": "AVOID_STACK_SIZE", "params": { "size": 2 }, "description": "Never deliver when carrying exactly 2 parcels — keep picking up until count differs" }
     { "type": "PREFERRED_DELIVERY", "params": { "tiles": [{"x":4,"y":7}] }, "description": "Prefer delivery at (4,7)" }
     { "type": "AVOID_TILE", "params": { "x": 5, "y": 3 }, "description": "Avoid tile (5,3)" }
     { "type": "SCORE_FILTER", "params": { "maxReward": 10 }, "description": "Only deliver parcels reward <= 10" }
@@ -688,7 +689,8 @@ Mission decision rules:
     "-5pts", "-5 pts", "-5 pts.", "-5 points", "minus 5 points", "lose 5pts", "costs 5pts", etc.
   * If the point value is NEGATIVE (less than zero), ALWAYS decline regardless of formatting.
     Reply with "Mission declined: not profitable." and give Final Answer immediately. Do NOT call any tools.
-  * If the point value is POSITIVE or the mission gives a reward multiplier, accept and execute it.
+  * If the point value is POSITIVE or the mission gives a reward multiplier GREATER THAN 1 (e.g. "double the reward", "2x reward", "triple points", "200% of the standard reward"), accept and execute it.
+  * If the mission gives a reward multiplier or fraction LESS THAN 1 (e.g. "0.3 of the standard reward", "half the reward", "50% of normal"), this means executing it earns LESS than normal — it is non-profitable. Do NOT apply the requested constraint. Instead, actively counteract it: if the mission specifies a stack size N with a sub-1 multiplier, call send_mission_to_bdi with type "AVOID_STACK_SIZE" and the same size N so both agents avoid delivering exactly N parcels at a time. Then give Final Answer: "Avoided non-profitable constraint: <brief reason>."
   * If the mission mentions NO points, reward, multiplier, or other concrete benefit — even if it sounds like a normal, executable instruction (e.g. "Go to somewhere around the middle of the map.", "Move to the rightmost walkable tile.", "Explore the north area.") — it has no objective and must be declined. A mission being phrased as an actionable command does NOT make it profitable. Reply with "Mission declined: no objective or profit specified." and give Final Answer immediately. Do NOT call any tools.
   * If the mission's instructions are logically contradictory or impossible to satisfy as written (e.g. "Pick up all parcels but also avoid moving.", "Deliver parcels without picking any up.") — even if it states a point value — do NOT attempt a partial or "most direct interpretation" of it. Reply with "Mission declined: contradictory instructions." and give Final Answer immediately. Do NOT call any tools.
 - For Level 1 atomic missions (calculate, answer a question, drop a parcel, timed stop): execute them directly with tools above.
@@ -808,7 +810,7 @@ async function runMissionTurn(userInput, maxIterations = 100) {
                 console.log(`[LLM] executing tool: ${action}("${actionInput}")`);
                 observation = await TOOLS[action](actionInput);
                 // Level 2 missions run forever on the BDI — stop LLM iterations immediately
-                const LEVEL2_TYPES = ['AVOID_TILE', 'STACK_SIZE', 'PREFERRED_DELIVERY', 'SCORE_FILTER'];
+                const LEVEL2_TYPES = ['AVOID_TILE', 'STACK_SIZE', 'AVOID_STACK_SIZE', 'PREFERRED_DELIVERY', 'SCORE_FILTER'];
                 if (action === 'send_mission_to_bdi' && missionState.active && LEVEL2_TYPES.includes(missionState.type)) {
                     console.log(`[LLM] Level 2 mission "${missionState.type}" active — stopping iterations.`);
                     return observation;
@@ -937,6 +939,19 @@ socket.onMsg(async (id, name, msg) => {
     if (adminName && name !== adminName) {
         console.log(`[LLM] Ignoring mission from non-admin "${name}".`);
         return;
+    }
+
+    // Fast-path: immediately freeze this agent's sensing loop for stop-and-wait commands
+    // so normal pickup/delivery stops right away, before the LLM API round-trip completes.
+    // The full ReAct loop still runs to send MISSION to BDI and call wait_for_chat_signal.
+    if (!missionRunning && /(\bstop\b.*\bwait\b|\bwait.*for.*green\b|\bfreeze\b|\bred.?light\b)/i.test(msg)) {
+        setMissionState({
+            active: true,
+            type: 'WAIT_FOR_SIGNAL',
+            params: { frozen: true },
+            description: 'Waiting for green light',
+        });
+        console.log('[LLM] Stop command detected — pre-freezing local sensing loop');
     }
 
     missionQueue.push({ name, msg });

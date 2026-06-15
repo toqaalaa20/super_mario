@@ -76,6 +76,16 @@ socket.onMsg((id, name, msg) => {
         if (missionState.type === 'WAIT_FOR_SIGNAL' && msg.toLowerCase().includes('green')) {
             setMissionState({ ...missionState, params: { ...missionState.params, frozen: false } });
             console.log('[BDI] Green light received — unfreezing');
+        } else if (/(\bstop\b.*\bwait\b|\bwait.*for.*green\b|\bfreeze\b|\bred.?light\b)/i.test(msg)) {
+            // A human operator broadcast a stop-and-wait command directly in chat.
+            // Enter WAIT_FOR_SIGNAL immediately without waiting for the LLM to send a MISSION.
+            setMissionState({
+                active: true,
+                type: 'WAIT_FOR_SIGNAL',
+                params: { frozen: true },
+                description: 'Waiting for green light',
+            });
+            console.log('[BDI] Stop command detected in chat — entering WAIT_FOR_SIGNAL immediately');
         }
     }
 });
