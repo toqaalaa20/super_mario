@@ -221,23 +221,6 @@ async function applyMove(direction) {
     return true;
 }
 
-async function followPath(path, label) {
-    if (!Array.isArray(path) || path.length === 0) {
-        return `Error: no ${label} path found.`;
-    }
-
-    let steps = 0;
-    for (const direction of path) {
-        const ok = await applyMove(direction);
-        if (!ok) {
-            return `Error: blocked while following ${label} path after ${steps} step(s).`;
-        }
-        steps++;
-    }
-
-    return `Completed ${label} path in ${steps} step(s). Current position: (${Math.round(me.x)}, ${Math.round(me.y)}).`;
-}
-
 async function getMyPosition() {
     if (me.x === null) return 'Error: position not available yet.';
     return JSON.stringify({ x: me.x, y: me.y, score: me.score, name: me.name });

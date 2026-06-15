@@ -31,12 +31,6 @@ export function setMissionState(state) {
     console.log('[INTENTION] Mission state updated:', missionState);
 }
 
-export function resetState() {
-    current = null;
-    pickupAndDeliverStuckTicks = 0;
-    Object.assign(missionState, { active: false, type: null, params: {}, description: '' });
-}
-
 // ─── Mission-aware helpers ─────────────────────────────────────────────────────
 
 function isAvoidedTile(x, y) {
