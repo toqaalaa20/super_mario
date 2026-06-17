@@ -783,7 +783,7 @@ async function callLLM(messages, retries = 3) {
     }
 }
 
-async function runMissionTurn(userInput, maxIterations = 100) {
+async function runMissionTurn(userInput, maxIterations = 30) {
     const thread = [
         { role: 'system', content: SYSTEM_PROMPT },
         { role: 'user', content: userInput },
