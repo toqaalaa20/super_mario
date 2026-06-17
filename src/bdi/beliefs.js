@@ -6,9 +6,10 @@ export const beliefs = {
     agents: new Map(),      // id -> { id, name, x, y, score }
     carrying: [],           // parcel ids this agent is currently holding
     claimedByOther: new Map(), // agentId -> parcelId claimed by teammate
+    crates: new Map(),      // id -> { id, x, y } — static obstacles from sensing
 };
 let sensingTick = 0;
-export function updateFromSensing({ parcels, agents }) {
+export function updateFromSensing({ parcels, agents, crates }) {
     sensingTick++;
 
     for (const p of parcels ?? []) {
@@ -45,6 +46,10 @@ export function updateFromSensing({ parcels, agents }) {
         beliefs.agents.set(a.id, a);
     }
 
+    for (const c of crates ?? []) {
+        beliefs.crates.set(c.id, c);
+    }
+
     // Remove claims for parcels that are no longer visible
     for (const [agentId, parcelId] of beliefs.claimedByOther) {
         if (!beliefs.parcels.has(parcelId)) beliefs.claimedByOther.delete(agentId);
@@ -79,6 +84,26 @@ export function isWalkable(x, y, fromX, fromY) {
     // Treat other agents as obstacles
     for (const a of beliefs.agents.values()) {
         if (Math.round(a.x) === x && Math.round(a.y) === y) return false;
+    }
+
+    // A crate can be pushed if the tile it would slide into is clear (no wall,
+    // no crate, no agent). Two or more crates in a line cannot be pushed.
+    for (const c of beliefs.crates.values()) {
+        if (Math.round(c.x) === x && Math.round(c.y) === y) {
+            const pushX = x + dx;
+            const pushY = y + dy;
+            const dest = beliefs.map.find(t => t.x === pushX && t.y === pushY);
+            if (!dest || (dest.type !== '5' && dest.type !== '5!')) return false;
+            const crateBlocking = [...beliefs.crates.values()].some(
+                oc => Math.round(oc.x) === pushX && Math.round(oc.y) === pushY
+            );
+            if (crateBlocking) return false;
+            const agentBlocking = [...beliefs.agents.values()].some(
+                a => Math.round(a.x) === pushX && Math.round(a.y) === pushY
+            );
+            if (agentBlocking) return false;
+            break; // crate can be pushed — movement is allowed
+        }
     }
 
     return true;
